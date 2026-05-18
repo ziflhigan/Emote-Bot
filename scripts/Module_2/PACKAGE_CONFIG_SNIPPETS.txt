@@ -1,0 +1,121 @@
+============================================================
+PACKAGE CONFIG SNIPPETS FOR CUSTOM VISUAL EVIDENCE MESSAGES
+============================================================
+
+The Vision and Presence Detection Module publishes a custom ROS
+message: rchomeedu_vision/UserState.
+
+Phase 8 head posture should publish a second custom ROS message:
+rchomeedu_vision/HeadPostureState.
+
+For ROS to generate the Python import:
+
+    from rchomeedu_vision.msg import UserState
+    from rchomeedu_vision.msg import HeadPostureState
+
+Member 1 must update the existing package files inside the robot workspace:
+
+    ~/catkin_ws/src/rc-home-edu-learn-ros/rchomeedu_vision/package.xml
+    ~/catkin_ws/src/rc-home-edu-learn-ros/rchomeedu_vision/CMakeLists.txt
+
+This local development folder does not need its own root-level
+CMakeLists.txt or package.xml unless the team later converts it into
+its own standalone catkin package.
+
+------------------------------------------------------------
+1) package.xml - required dependencies
+------------------------------------------------------------
+
+Make sure these entries exist. If the package already contains some of
+these dependencies, do not duplicate them.
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <build_depend>rospy</build_depend>
+    <build_depend>std_msgs</build_depend>
+    <build_depend>opencv_apps</build_depend>
+    <build_depend>message_generation</build_depend>
+
+    <exec_depend>rospy</exec_depend>
+    <exec_depend>std_msgs</exec_depend>
+    <exec_depend>opencv_apps</exec_depend>
+    <exec_depend>message_runtime</exec_depend>
+
+If the existing package uses older tags such as run_depend, keep the
+package style consistent, but the meaning must remain the same.
+
+------------------------------------------------------------
+2) CMakeLists.txt - key blocks
+------------------------------------------------------------
+
+(a) find_package - include message_generation and the ROS deps:
+
+    find_package(catkin REQUIRED COMPONENTS
+      rospy
+      std_msgs
+      opencv_apps
+      message_generation
+    )
+
+(b) Register the custom messages:
+
+    add_message_files(
+      FILES
+      UserState.msg
+      HeadPostureState.msg
+    )
+
+(c) Generate messages:
+
+    generate_messages(
+      DEPENDENCIES
+      std_msgs
+    )
+
+(d) Declare runtime deps in catkin_package:
+
+    catkin_package(
+      CATKIN_DEPENDS rospy std_msgs opencv_apps message_runtime
+    )
+
+------------------------------------------------------------
+3) Rebuild
+------------------------------------------------------------
+
+    $ cd ~/catkin_ws
+    $ catkin_make
+    $ source devel/setup.bash
+
+------------------------------------------------------------
+4) Verify the generated message
+------------------------------------------------------------
+
+    $ rosmsg show rchomeedu_vision/UserState
+    $ rosmsg show rchomeedu_vision/HeadPostureState
+
+Expected output:
+
+    bool user_present
+    int32 consecutive_eyes_missing
+    int32 consecutive_face_absent
+    time stamp
+
+Expected HeadPostureState output:
+
+    bool pose_visible
+    bool calibrated
+    bool head_down
+    float32 posture_score
+    float32 head_drop_ratio
+    float32 baseline_ratio
+    int32 consecutive_droop_frames
+    time stamp
+
+------------------------------------------------------------
+SHARED-ROBOT SAFETY NOTE
+------------------------------------------------------------
+
+None of the above installs anything system-wide. catkin_make only
+builds inside the catkin workspace. message_generation and
+message_runtime are standard ROS dependencies that should already be
+available on the robot image.
