@@ -1,0 +1,12 @@
+<launch>
+  <arg name="face_topic" default="/face_detection/faces"/>
+  <arg name="state_topic" default="/focus_robot/user_state"/>
+
+  <node name="user_state_monitor"
+        pkg="vision_presence_module"
+        type="user_state_monitor.py"
+        output="screen">
+    <param name="face_topic" value="$(arg face_topic)"/>
+    <param name="state_topic" value="$(arg state_topic)"/>
+  </node>
+</launch>
