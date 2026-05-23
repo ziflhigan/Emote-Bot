@@ -14,8 +14,8 @@ opencv_apps/FaceArrayStamped
 Output:
 
 ```text
-/focus_robot/user_state
-vision_presence_module/UserState
+Topic name:   /vision_and_presence_detection
+Message type: vision_presence_module/UserState
 ```
 
 Message fields:
@@ -24,6 +24,7 @@ Message fields:
 bool user_present
 int32 consecutive_eyes_missing
 int32 consecutive_face_absent
+time stamp
 ```
 
 This module only reports camera evidence. It does not decide fatigue, manage sessions, parse voice commands, or speak.
@@ -59,9 +60,9 @@ Use these commands for online testing and report screenshots:
 
 ```bash
 rostopic info /face_detection/faces
-rostopic info /focus_robot/user_state
-rostopic echo /focus_robot/user_state
-rostopic hz /focus_robot/user_state
+rostopic info /vision_and_presence_detection
+rostopic echo /vision_and_presence_detection
+rostopic hz /vision_and_presence_detection
 rosmsg show vision_presence_module/UserState
 rosnode info /user_state_monitor
 ```
@@ -71,3 +72,7 @@ For a terminal printer:
 ```bash
 rosrun vision_presence_module user_state_monitor.py --print
 ```
+
+For teammate handoff, see `MODULE2_HANDOFF.md`.
+
+For detailed test and real-robot runtime steps, see `TEST.md`.

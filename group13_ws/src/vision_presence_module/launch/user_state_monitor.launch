@@ -1,6 +1,6 @@
 <launch>
   <arg name="face_topic" default="/face_detection/faces"/>
-  <arg name="state_topic" default="/focus_robot/user_state"/>
+  <arg name="state_topic" default="/vision_and_presence_detection"/>
 
   <node name="user_state_monitor"
         pkg="vision_presence_module"

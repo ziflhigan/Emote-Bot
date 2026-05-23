@@ -47,7 +47,7 @@ class UserStateMonitor:
             "~face_topic", "/face_detection/faces"
         )
         self.state_topic = rospy.get_param(
-            "~state_topic", "/focus_robot/user_state"
+            "~state_topic", "/vision_and_presence_detection"
         )
 
         self.publisher = rospy.Publisher(
@@ -71,6 +71,7 @@ class UserStateMonitor:
         return False
 
     def face_callback(self, msg):
+        now = rospy.Time.now()
         faces = msg.faces
         faces_exist = len(faces) > 0
         eyes_exist = self._eyes_exist(faces) if faces_exist else False
@@ -78,15 +79,16 @@ class UserStateMonitor:
         self.logic.update(
             faces_exist=faces_exist,
             eyes_exist=eyes_exist,
-            timestamp=rospy.Time.now().to_sec(),
+            timestamp=now.to_sec(),
         )
-        self.publish_state()
+        self.publish_state(now)
 
-    def publish_state(self):
+    def publish_state(self, stamp):
         msg = UserState()
         msg.user_present = self.logic.user_present
         msg.consecutive_eyes_missing = self.logic.consecutive_eyes_missing
         msg.consecutive_face_absent = self.logic.consecutive_face_absent
+        msg.stamp = stamp
         self.publisher.publish(msg)
 
         rospy.loginfo_throttle(
@@ -100,6 +102,7 @@ class UserStateMonitor:
 
 def print_state_callback(msg):
     print("")
+    print("stamp                    : %s" % msg.stamp)
     print("user_present             : %s" % msg.user_present)
     print("consecutive_eyes_missing : %d" % msg.consecutive_eyes_missing)
     print("consecutive_face_absent  : %d" % msg.consecutive_face_absent)
@@ -108,7 +111,7 @@ def print_state_callback(msg):
 def run_debug_printer():
     rospy.init_node("user_state_debug_printer")
     state_topic = rospy.get_param(
-        "~state_topic", "/focus_robot/user_state"
+        "~state_topic", "/vision_and_presence_detection"
     )
     rospy.Subscriber(state_topic, UserState, print_state_callback)
     rospy.loginfo("Debug printer subscribed to %s", state_topic)
