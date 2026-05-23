@@ -1,0 +1,24 @@
+<launch>
+  <arg name="pose_topic" default="/mediapipe/pose_landmarks"/>
+  <arg name="state_topic" default="/head_posture_state"/>
+  <arg name="pose_msg_module" default=""/>
+  <arg name="pose_msg_type" default=""/>
+  <arg name="session_active_topic" default=""/>
+
+  <node name="head_posture_node"
+        pkg="head_posture_module"
+        type="head_posture_node.py"
+        output="screen">
+    <param name="pose_topic" value="$(arg pose_topic)"/>
+    <param name="state_topic" value="$(arg state_topic)"/>
+    <param name="pose_msg_module" value="$(arg pose_msg_module)"/>
+    <param name="pose_msg_type" value="$(arg pose_msg_type)"/>
+    <param name="session_active_topic" value="$(arg session_active_topic)"/>
+    <param name="image_height" value="480"/>
+    <param name="coords_normalized" value="true"/>
+    <param name="calibration_duration" value="30.0"/>
+    <param name="droop_frame_threshold" value="15"/>
+    <param name="droop_pixel_threshold" value="30.0"/>
+    <param name="min_landmark_visibility" value="0.5"/>
+  </node>
+</launch>
