@@ -1,0 +1,60 @@
+# Production-default compose. Only the FastAPI port is exposed to the host/LAN.
+# For testing (Ollama also exposed), see docker-compose.testing.yml.
+
+services:
+  ollama:
+    image: ollama/ollama:0.24.0
+    container_name: vlm-ollama
+    restart: unless-stopped
+    # Only reachable from within the compose network; not published to host.
+    expose:
+      - "11434"
+    environment:
+      # Listen on all interfaces inside the container so the api service can reach it.
+      OLLAMA_HOST: "0.0.0.0:11434"
+      BASE_MODEL: "qwen3.5:0.8b"
+      CUSTOM_MODEL: "qwen3.5-64k:0.8b"
+      NUM_CTX: "64000"
+    volumes:
+      # Persists pulled models + the custom 64k variant across container rebuilds.
+      - ollama_models:/root/.ollama
+      # Init script mounted read-only.
+      - ./scripts/ollama-init.sh:/usr/local/bin/ollama-init.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/ollama-init.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 && ollama list | awk '{print $$1}' | grep -qx qwen3.5-64k:0.8b"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # Give first-run time to download the model.
+      start_period: 600s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vlm-api
+    restart: unless-stopped
+    ports:
+      # Bind to all host interfaces so other LAN devices can reach it.
+      - "8000:8000"
+    environment:
+      # The api talks to ollama over the internal docker network by service name.
+      OLLAMA_HOST: "http://ollama:11434"
+      OLLAMA_MODEL: "qwen3.5-64k:0.8b"
+      # VLM gating — see app/config.py for full list.
+      TRIGGER_SUSTAIN_SECS: "10"
+      COOLDOWN_SECS: "30"
+      FATIGUE_LEVEL_TRIGGER: "2"
+      EYES_MISSING_TRIGGER: "30"
+      OLLAMA_TIMEOUT_SECS: "60"
+    volumes:
+      # Live-mount app code; remove this line if you want a fully baked image.
+      - ./app:/srv/app:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  ollama_models:
+    # Named volume; survives `docker compose down` (not `down -v`).
