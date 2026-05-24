@@ -274,7 +274,17 @@ class FatigueMonitor:
             return 0.0
         rmat, _ = cv2.Rodrigues(rvec)
         angles, *_ = cv2.RQDecomp3x3(rmat)
-        return angles[0]
+        pitch = angles[0]
+
+        # Fix PnP flip ambiguity
+        # If pitch is near ±180 the solution flipped to back-of-head
+        # Correct by subtracting 180 and flipping sign
+        if pitch > 90:
+            pitch = pitch - 180
+        elif pitch < -90:
+            pitch = pitch + 180
+
+        return pitch
 
     def _time_multiplier(self) -> float:
         mins = self.s.elapsed_secs / 60
