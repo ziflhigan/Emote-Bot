@@ -30,5 +30,6 @@ catkin_package(
 catkin_install_python(PROGRAMS
   scripts/user_state_monitor.py
   scripts/head_posture.py
+  scripts/voice_command.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
