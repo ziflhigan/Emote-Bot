@@ -1,0 +1,49 @@
+<launch>
+  <!--
+    Launch file for the Text-to-Speech Output Module.
+
+    This file brings up TWO nodes together, exactly like
+    say_hello_ans.launch in the kids module:
+
+      1. soundplay_node  - the TTS server (does actual synthesis)
+      2. speech_output   - our client, subscribes to /tts_request
+                           and forwards into SoundClient
+
+    Recommended launch order:
+      Terminal 1:  roscore
+      Terminal 2:  roslaunch speech_output_module speech_output.launch
+      Terminal 3:  rostopic pub -1 /tts_request std_msgs/String "data: 'hello'"
+
+    Override examples:
+      roslaunch speech_output_module speech_output.launch tts_topic:=/say
+      roslaunch speech_output_module speech_output.launch dedupe_seconds:=10.0
+      roslaunch speech_output_module speech_output.launch voice:=voice_kal_diphone
+
+    Note: this module SPEAKS only. It does not detect fatigue,
+    parse voice, or decide content. Other modules publish to
+    /tts_request to make the robot talk.
+  -->
+
+  <arg name="tts_topic"      default="/tts_request"/>
+  <arg name="dedupe_seconds" default="5.0"/>
+  <arg name="connect_delay"  default="1.0"/>
+  <arg name="voice"          default=""/>
+  <arg name="volume"         default="1.0"/>
+
+  <!-- The sound_play TTS server (must run for SoundClient to work). -->
+  <node name="soundplay_node"
+        pkg="sound_play"
+        type="soundplay_node.py"/>
+
+  <!-- Our client node. -->
+  <node name="speech_output"
+        pkg="speech_output_module"
+        type="speech_output.py"
+        output="screen">
+    <param name="tts_topic"      value="$(arg tts_topic)"/>
+    <param name="dedupe_seconds" value="$(arg dedupe_seconds)"/>
+    <param name="connect_delay"  value="$(arg connect_delay)"/>
+    <param name="voice"          value="$(arg voice)"/>
+    <param name="volume"         value="$(arg volume)"/>
+  </node>
+</launch>
