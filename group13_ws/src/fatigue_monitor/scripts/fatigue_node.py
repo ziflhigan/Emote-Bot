@@ -7,7 +7,7 @@ Role in integrated system:
   Computes fatigue signals (EAR, PERCLOS, head pitch, face absence).
   Enriches with Member 2 (user state) and Member 6 (head posture).
   Publishes all metrics for LLM brain to consume and act on.
-  Does NOT manage sessions — session manager handles that.
+  Does NOT manage sessions — LLM module handles session state.
   Does NOT use SoundClient directly — speech_output_module handles TTS.
 
 TTS integration:
@@ -18,14 +18,15 @@ TTS integration:
 
   Standalone fallback mode:
     Run with _local_tts_enabled:=true
-    This node publishes simple local intervention messages to /tts_request
+    This node publishes simple local intervention messages to /tts_request.
+    Since session state is owned by LLM, fallback mode is always-on and
+    guarded only by fatigue level and minimum message gap.
 
 Subscribes to:
   /usb_cam/image_raw                 sensor_msgs/Image    own camera pipeline
   /vision_and_presence_detection     UserState            Member 2
   /head_posture_state                HeadPosture          Member 6
   /voice_command                     std_msgs/String      dismiss only
-  /focus_robot/session_active        std_msgs/Bool        from session manager
 
 Publishes:
   /focus_robot/fatigue_level         std_msgs/Int32       0-3
@@ -51,7 +52,7 @@ import numpy as np
 import rospy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, Float32, Int32, String
+from std_msgs.msg import Float32, Int32, String
 
 
 # ── Member 2 import ───────────────────────────────────────────────────────
@@ -138,12 +139,6 @@ class Metrics:
     fatigue_level   : int   = 0
 
 
-@dataclass
-class SessionState:
-    active      : bool  = False
-    start_time  : float = 0.0
-    elapsed_secs: float = 0.0
-
 
 @dataclass
 class M2State:
@@ -207,7 +202,6 @@ class FatigueMonitor:
 
         # ── Internal state ────────────────────────────────────────────────
         self.m   = Metrics()
-        self.s   = SessionState()
         self.m2  = M2State()
         self.m6  = M6State()
 
@@ -223,8 +217,6 @@ class FatigueMonitor:
         # ── Local TTS fallback config ─────────────────────────────────────
         self.local_tts = rospy.get_param("~local_tts_enabled", False)
         self.last_intv_time      : float = 0.0
-        self.session_warmup_done : bool  = False
-        self.WARMUP_SECS  = float(rospy.get_param("~warmup_secs", 30.0))
         self.MIN_INTV_GAP = float(rospy.get_param("~min_intv_gap_secs", 30.0))
 
         rospy.loginfo(
@@ -265,11 +257,6 @@ class FatigueMonitor:
         rospy.Subscriber(
             "/usb_cam/image_raw", Image, self._image_callback)
 
-        session_topic = rospy.get_param(
-            "~session_active_topic", "/focus_robot/session_active")
-        rospy.Subscriber(
-            session_topic, Bool, self._session_callback)
-        rospy.loginfo("FatigueMonitor: session topic = %s", session_topic)
 
         # Voice command module — dismiss only
         rospy.Subscriber(
@@ -306,7 +293,7 @@ class FatigueMonitor:
                 "running without body posture data")
 
         rospy.loginfo(
-            "FatigueMonitor: ready — waiting for session_active signal")
+            "FatigueMonitor: ready — always monitoring; LLM manages session state")
 
     # ──────────────────────────────────────────────────────────────────────
     # MEMBER 2 CALLBACK
@@ -348,14 +335,12 @@ class FatigueMonitor:
     # ──────────────────────────────────────────────────────────────────────
     def _try_local_tts(self):
         """
-        Fallback intervention path used only when local_tts_enabled=True.
+        Fallback TTS used only when local_tts_enabled=True.
 
-        Default mode:
-          LLM brain subscribes to /focus_robot/fatigue_summary and decides
-          when/what to publish to /tts_request.
-
-        Standalone mode:
-          This node generates simple interventions itself.
+        Session timing is owned by LLM, so this fallback is always-on and
+        only uses two guards:
+          1. fatigue_level must be > 0
+          2. minimum intervention gap must have passed
         """
         level = self.m.fatigue_level
         if level == 0:
@@ -376,38 +361,6 @@ class FatigueMonitor:
         self.last_intv_time = now
         self._write_log("LOCAL_TTS")
 
-    # ──────────────────────────────────────────────────────────────────────
-    # SESSION CALLBACK — from session manager / LLM
-    # ──────────────────────────────────────────────────────────────────────
-    def _session_callback(self, msg):
-        """
-        Receives Bool from session manager.
-        True  = session started, begin fatigue monitoring.
-        False = session ended, pause monitoring.
-        """
-        was_active = self.s.active
-        self.s.active = msg.data
-
-        if msg.data and not was_active:
-            self.s.start_time    = time.time()
-            self.s.elapsed_secs  = 0.0
-            self.session_warmup_done = False
-            self.last_metric_log_time = 0.0
-            self.last_intv_time = 0.0
-            self.perclos_buf.clear()
-
-            self._write_event("SESSION START — received from session manager")
-            rospy.loginfo("[SESSION] Started — fatigue monitoring active")
-
-        elif not msg.data and was_active:
-            mins = int(self.s.elapsed_secs / 60)
-            self.session_warmup_done = False
-
-            self._write_event(
-                f"SESSION END — elapsed {mins}min "
-                f"final score {self.m.fatigue_score:.2f}"
-            )
-            rospy.loginfo("[SESSION] Ended — %d minutes elapsed", mins)
 
     # ──────────────────────────────────────────────────────────────────────
     # VOICE CALLBACK — dismiss only
@@ -415,7 +368,7 @@ class FatigueMonitor:
     def _voice_callback(self, msg):
         """
         Only handles 'dismiss' from the voice module.
-        All other commands are handled by the session manager.
+        All other commands are handled by the LLM module.
         """
         cmd = msg.data.strip().lower()
 
@@ -428,7 +381,7 @@ class FatigueMonitor:
         else:
             rospy.logdebug(
                 "FatigueMonitor received voice cmd '%s' — "
-                "session manager handles session commands",
+                "LLM module handles session commands",
                 cmd
             )
 
@@ -525,13 +478,11 @@ class FatigueMonitor:
         return pitch
 
     def _time_multiplier(self) -> float:
-        mins = self.s.elapsed_secs / 60
-
-        if mins < 20:
-            return CFG["TIME_MUL_20MIN"]
-        if mins < 40:
-            return CFG["TIME_MUL_40MIN"]
-        return CFG["TIME_MUL_60PLUS"]
+        """
+        Session duration is owned by LLM.
+        No local time scaling is applied here.
+        """
+        return 1.0
 
     # ──────────────────────────────────────────────────────────────────────
     # FATIGUE SCORE — integrates own signals, M2, and updated M6 logic
@@ -681,12 +632,7 @@ class FatigueMonitor:
 
             self._update_perclos(False)
 
-        # Session elapsed and warmup tracking.
-        if self.s.active:
-            self.s.elapsed_secs = now - self.s.start_time
-            self.session_warmup_done = (
-                self.s.elapsed_secs > self.WARMUP_SECS
-            )
+        # Always-on monitoring. Session state is handled by LLM.
 
         # Score and level.
         m.fatigue_score = self._compute_score()
@@ -696,12 +642,11 @@ class FatigueMonitor:
         self._publish_all()
 
         # Local TTS fallback only.
-        if self.s.active and self.local_tts and self.session_warmup_done:
+        if self.local_tts:
             self._try_local_tts()
 
-        # Periodic logging.
-        if (self.s.active and
-                now - self.last_metric_log_time >= CFG["LOG_INTERVAL_SECS"]):
+        # Periodic logging, independent of session state.
+        if now - self.last_metric_log_time >= CFG["LOG_INTERVAL_SECS"]:
             self._write_log("METRIC")
             self.last_metric_log_time = now
 
@@ -752,10 +697,7 @@ class FatigueMonitor:
             "m6_head_down"      : self.m6.head_down,
             "m6_posture_score"  : round(self.m6.posture_score, 3),
 
-            # Session info
-            "session_active"    : self.s.active,
-            "elapsed_secs"      : round(self.s.elapsed_secs, 0),
-            "elapsed_mins"      : round(self.s.elapsed_secs / 60, 1),
+            # Session info intentionally omitted. LLM owns session state.
 
             # TTS mode info
             "local_tts_enabled" : self.local_tts,
@@ -801,7 +743,6 @@ class FatigueMonitor:
     def _draw(self, frame: np.ndarray) -> np.ndarray:
         h, w  = frame.shape[:2]
         m     = self.m
-        s     = self.s
         now   = time.time()
         lvl   = m.fatigue_level
         col   = LEVEL_COLOR[lvl]
@@ -813,23 +754,10 @@ class FatigueMonitor:
         cv2.rectangle(frame, (0, 0), (270, h), (0, 0, 0), -1)
         cv2.line(frame, (270, 0), (270, h), (50, 50, 50), 1)
 
-        # Session.
-        self._txt(frame, "SESSION", 22, (255, 255, 255), 0.55, True)
-
-        if s.active:
-            mm = int(s.elapsed_secs // 60)
-            ss = int(s.elapsed_secs  % 60)
-            self._txt(frame, f"  {mm:02d}:{ss:02d} elapsed", 42, (0, 220, 0))
-            self._txt(frame, "  Monitoring ACTIVE", 60, (0, 220, 120))
-        else:
-            self._txt(frame, "  Waiting for session", 42, (120, 120, 120))
-            self._txt(
-                frame,
-                "  (session manager controls)",
-                60,
-                (80, 80, 80),
-                0.40
-            )
+        # Status.
+        self._txt(frame, "STATUS", 22, (255, 255, 255), 0.55, True)
+        self._txt(frame, "  Always monitoring", 42, (0, 220, 0))
+        self._txt(frame, "  LLM manages session", 60, (80, 80, 80), 0.40)
 
         cv2.line(frame, (0, 72), (270, 72), (50, 50, 50), 1)
 
@@ -1037,10 +965,7 @@ class FatigueMonitor:
             f.write("-" * 72 + "\n")
 
     def _elapsed_str(self) -> str:
-        mm = int(self.s.elapsed_secs // 60)
-        ss = int(self.s.elapsed_secs  % 60)
-
-        return f"{mm:02d}:{ss:02d}"
+        return "--:--"
 
     def _write_log(self, entry_type: str):
         m = self.m
