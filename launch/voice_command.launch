@@ -1,0 +1,40 @@
+<launch>
+  <!--
+    Launch file for the Voice Input and Command Parsing Module.
+
+    This node opens the default ALSA capture device, transcribes
+    spoken phrases via SpeechRecognition.recognize_google(), applies
+    a wake-word gate, and publishes the parsed command body on
+    /voice_command (std_msgs/String).
+
+    Recommended launch order:
+      Terminal 1:  roscore
+      Terminal 2:  roslaunch emote_bot voice_command.launch
+      Terminal 3:  rostopic echo /voice_command            (optional debug)
+
+    Override examples:
+      roslaunch emote_bot voice_command.launch wake_word:=emote
+      roslaunch emote_bot voice_command.launch phrase_limit:=8.0
+      roslaunch emote_bot voice_command.launch command_topic:=/session_voice
+
+    Note: no soundplay_node is launched here, because this module
+    does not speak. It only reports what the user said. Audio output
+    is the responsibility of other modules. Internet is required at
+    runtime for recognize_google().
+  -->
+
+  <arg name="wake_word"       default="robot"/>
+  <arg name="ambient_seconds" default="2.0"/>
+  <arg name="phrase_limit"    default="5.0"/>
+  <arg name="command_topic"   default="/voice_command"/>
+
+  <node name="voice_command"
+        pkg="emote_bot"
+        type="voice_command.py"
+        output="screen">
+    <param name="wake_word"       value="$(arg wake_word)"/>
+    <param name="ambient_seconds" value="$(arg ambient_seconds)"/>
+    <param name="phrase_limit"    value="$(arg phrase_limit)"/>
+    <param name="command_topic"   value="$(arg command_topic)"/>
+  </node>
+</launch>
