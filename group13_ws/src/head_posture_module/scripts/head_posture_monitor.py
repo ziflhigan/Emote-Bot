@@ -1,13 +1,40 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+Head Posture Monitor — ROS Node
+Module 6 — head_posture_module package
+
+Same camera stack as fatigue_monitor (usb_cam + MediaPipe on board).
+
+Run sequence:
+  Terminal 1: roscore
+  Terminal 2: roslaunch usb_cam usb_cam-test.launch
+  Terminal 3: roslaunch head_posture_module head_posture_monitor.launch
+
+Publishes:
+  /head_posture_state  head_posture_module/HeadPosture
+
+Subscribes:
+  /usb_cam/image_raw              sensor_msgs/Image   (default)
+  /focus_robot/session_active     std_msgs/Bool       (optional recalibration)
+"""
 
 import importlib
 import sys
 import time
 
+import cv2
+import mediapipe as mp
 import rospy
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 
 from head_posture_module.msg import HeadPosture
+
+# MediaPipe Pose landmark indices
+NOSE = 0
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
 
 
 class HeadPostureLogic:
@@ -104,7 +131,9 @@ class HeadPostureLogic:
 
 class HeadPostureMonitor:
     DEFAULT_STATE_TOPIC = "/head_posture_state"
+    DEFAULT_IMAGE_TOPIC = "/usb_cam/image_raw"
     DEFAULT_POSE_TOPIC = "/mediapipe/pose_landmarks"
+    DEFAULT_SESSION_TOPIC = "/focus_robot/session_active"
 
     def __init__(self):
         rospy.init_node("head_posture_monitor")
@@ -112,6 +141,9 @@ class HeadPostureMonitor:
 
         self.logic = HeadPostureLogic()
         self._last_session_active = False
+        self.bridge = CvBridge()
+        self.pose_detector = None
+        self.show_window = False
 
         self.logic.calibration_duration = rospy.get_param(
             "~calibration_duration", 30.0
@@ -125,42 +157,32 @@ class HeadPostureMonitor:
         self.min_visibility = float(
             rospy.get_param("~min_landmark_visibility", 0.5)
         )
-        self.image_height = float(rospy.get_param("~image_height", 480.0))
         self.coords_normalized = rospy.get_param("~coords_normalized", True)
 
-        self.pose_topic = rospy.get_param(
-            "~pose_topic", self.DEFAULT_POSE_TOPIC
+        self.image_topic = rospy.get_param(
+            "~image_topic", self.DEFAULT_IMAGE_TOPIC
         )
         self.state_topic = rospy.get_param(
             "~state_topic", self.DEFAULT_STATE_TOPIC
         )
-        self.session_active_topic = rospy.get_param("~session_active_topic", "")
+        self.session_active_topic = rospy.get_param(
+            "~session_active_topic", self.DEFAULT_SESSION_TOPIC
+        )
+        self.use_external_pose = rospy.get_param("~use_external_pose", False)
+        self.show_window = rospy.get_param("~show_window", False)
+
+        self.pose_topic = rospy.get_param(
+            "~pose_topic", self.DEFAULT_POSE_TOPIC
+        )
 
         self.publisher = rospy.Publisher(
             self.state_topic, HeadPosture, queue_size=10
         )
 
-        pose_msg_module = rospy.get_param("~pose_msg_module", "")
-        pose_msg_type = rospy.get_param("~pose_msg_type", "")
-
-        if pose_msg_module and pose_msg_type:
-            pose_msg_class = self._load_pose_message_class(
-                pose_msg_module, pose_msg_type
-            )
-            rospy.Subscriber(self.pose_topic, pose_msg_class, self.pose_callback)
-            rospy.loginfo(
-                "Subscribed to: %s (%s/%s)",
-                self.pose_topic,
-                pose_msg_module,
-                pose_msg_type,
-            )
+        if self.use_external_pose:
+            self._setup_external_pose_subscriber()
         else:
-            rospy.logwarn(
-                "MediaPipe subscriber disabled. On the robot, set private params "
-                "~pose_msg_module and ~pose_msg_type after running: "
-                "rostopic info %s",
-                self.pose_topic,
-            )
+            self._setup_camera_subscriber()
 
         if self.session_active_topic:
             rospy.Subscriber(
@@ -178,6 +200,42 @@ class HeadPostureMonitor:
         rospy.loginfo("Publishing to: %s", self.state_topic)
 
         self.publish_state(rospy.Time.now())
+
+    def _setup_camera_subscriber(self):
+        mp_pose = mp.solutions.pose
+        self.pose_detector = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        rospy.Subscriber(
+            self.image_topic, Image, self.image_callback, queue_size=1
+        )
+        rospy.loginfo("Subscribed to camera: %s", self.image_topic)
+
+    def _setup_external_pose_subscriber(self):
+        pose_msg_module = rospy.get_param("~pose_msg_module", "")
+        pose_msg_type = rospy.get_param("~pose_msg_type", "")
+
+        if not pose_msg_module or not pose_msg_type:
+            rospy.logfatal(
+                "use_external_pose is true but ~pose_msg_module / "
+                "~pose_msg_type are not set. Run: rostopic info %s",
+                self.pose_topic,
+            )
+            raise rospy.ROSException("Missing pose message type parameters")
+
+        pose_msg_class = self._load_pose_message_class(
+            pose_msg_module, pose_msg_type
+        )
+        rospy.Subscriber(self.pose_topic, pose_msg_class, self.pose_callback)
+        rospy.loginfo(
+            "Subscribed to external pose: %s (%s/%s)",
+            self.pose_topic,
+            pose_msg_module,
+            pose_msg_type,
+        )
 
     def _load_pose_message_class(self, module_name, type_name):
         try:
@@ -201,10 +259,79 @@ class HeadPostureMonitor:
         self._last_session_active = msg.data
 
     def cleanup(self):
+        if self.pose_detector is not None:
+            self.pose_detector.close()
+            self.pose_detector = None
+        cv2.destroyAllWindows()
         rospy.loginfo("HeadPostureMonitor shutting down.")
+
+    def image_callback(self, msg):
+        if self.pose_detector is None:
+            return
+
+        now = rospy.Time.now()
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "CvBridge error: %s", exc)
+            return
+
+        frame = cv2.flip(frame, 1)
+        image_height = frame.shape[0]
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.pose_detector.process(rgb)
+
+        if not results.pose_landmarks:
+            self.logic.set_pose_not_visible()
+            self.publish_state(now)
+            self._maybe_show(frame)
+            return
+
+        landmarks = results.pose_landmarks.landmark
+        if len(landmarks) < 13:
+            self.logic.set_pose_not_visible()
+            self.publish_state(now)
+            self._maybe_show(frame)
+            return
+
+        nose = landmarks[NOSE]
+        left_shoulder = landmarks[LEFT_SHOULDER]
+        right_shoulder = landmarks[RIGHT_SHOULDER]
+
+        if (
+            nose.visibility < self.min_visibility
+            or left_shoulder.visibility < self.min_visibility
+            or right_shoulder.visibility < self.min_visibility
+        ):
+            self.logic.set_pose_not_visible()
+            self.publish_state(now)
+            self._maybe_show(frame)
+            return
+
+        nose_y = self._scale_coord(nose.y, image_height)
+        left_shoulder_y = self._scale_coord(
+            left_shoulder.y, image_height
+        )
+        right_shoulder_y = self._scale_coord(
+            right_shoulder.y, image_height
+        )
+
+        self.logic.process_frame(
+            nose_y, left_shoulder_y, right_shoulder_y
+        )
+        self.publish_state(now)
+        self._maybe_show(frame)
+
+    def _maybe_show(self, frame):
+        if not self.show_window:
+            return
+        cv2.imshow("Head Posture Monitor", frame)
+        cv2.waitKey(1)
 
     def pose_callback(self, msg):
         now = rospy.Time.now()
+        image_height = float(rospy.get_param("~image_height", 480.0))
 
         try:
             landmarks = self._extract_landmarks(msg)
@@ -226,9 +353,13 @@ class HeadPostureMonitor:
                 self.publish_state(now)
                 return
 
-            nose_y = self._scale_coord(nose.y)
-            left_shoulder_y = self._scale_coord(left_shoulder.y)
-            right_shoulder_y = self._scale_coord(right_shoulder.y)
+            nose_y = self._scale_coord(nose.y, image_height)
+            left_shoulder_y = self._scale_coord(
+                left_shoulder.y, image_height
+            )
+            right_shoulder_y = self._scale_coord(
+                right_shoulder.y, image_height
+            )
 
             self.logic.process_frame(
                 nose_y, left_shoulder_y, right_shoulder_y
@@ -240,9 +371,9 @@ class HeadPostureMonitor:
 
         self.publish_state(now)
 
-    def _scale_coord(self, value):
+    def _scale_coord(self, value, image_height):
         if self.coords_normalized:
-            return value * self.image_height
+            return value * image_height
         return value
 
     @staticmethod

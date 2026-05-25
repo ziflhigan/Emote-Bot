@@ -4,10 +4,9 @@
 
 - Package: `head_posture_module` in `group13_ws/src/`
 - Launch: `roslaunch head_posture_module head_posture_monitor.launch`
-- Start **after** USB camera and MediaPipe pose (user guide §3.6)
-- Required launch args on robot (from `rostopic info`):
-  - `pose_msg_module` — ROS package name containing the pose message
-  - `pose_msg_type` — message class name (e.g. `PoseLandmarks`)
+- Start **after** USB camera (`usb_cam`), same as fatigue_monitor
+- Default: subscribes to `/usb_cam/image_raw` and runs MediaPipe Pose on-board
+- Optional external pose topic: set `use_external_pose:=true` plus `pose_msg_module` / `pose_msg_type` from `rostopic info`
 
 ## For Member 5 (Fatigue Monitor)
 
@@ -27,18 +26,9 @@ Use in fatigue score:
 ## Robot setup (Monday)
 
 ```bash
-rostopic list | grep -i pose
-rostopic info /mediapipe/pose_landmarks
-rostopic echo /mediapipe/pose_landmarks -n1
-```
-
-Then:
-
-```bash
 cd ~/group13_ws && catkin_make && source devel/setup.bash
-roslaunch head_posture_module head_posture_monitor.launch \
-  pose_msg_module:=<from_rostopic_info> \
-  pose_msg_type:=<from_rostopic_info>
+roslaunch usb_cam usb_cam-test.launch
+roslaunch head_posture_module head_posture_monitor.launch
 ```
 
 Debug output without parsing pose (another terminal):

@@ -1,20 +1,25 @@
 <launch>
-  <arg name="pose_topic" default="/mediapipe/pose_landmarks"/>
+  <arg name="image_topic" default="/usb_cam/image_raw"/>
   <arg name="state_topic" default="/head_posture_state"/>
+  <arg name="session_active_topic" default="/focus_robot/session_active"/>
+  <arg name="use_external_pose" default="false"/>
+  <arg name="pose_topic" default="/mediapipe/pose_landmarks"/>
   <arg name="pose_msg_module" default=""/>
   <arg name="pose_msg_type" default=""/>
-  <arg name="session_active_topic" default=""/>
+  <arg name="show_window" default="false"/>
 
   <node name="head_posture_monitor"
         pkg="head_posture_module"
         type="head_posture_monitor.py"
         output="screen">
-    <param name="pose_topic" value="$(arg pose_topic)"/>
+    <param name="image_topic" value="$(arg image_topic)"/>
     <param name="state_topic" value="$(arg state_topic)"/>
+    <param name="session_active_topic" value="$(arg session_active_topic)"/>
+    <param name="use_external_pose" value="$(arg use_external_pose)"/>
+    <param name="pose_topic" value="$(arg pose_topic)"/>
     <param name="pose_msg_module" value="$(arg pose_msg_module)"/>
     <param name="pose_msg_type" value="$(arg pose_msg_type)"/>
-    <param name="session_active_topic" value="$(arg session_active_topic)"/>
-    <param name="image_height" value="480"/>
+    <param name="show_window" value="$(arg show_window)"/>
     <param name="coords_normalized" value="true"/>
     <param name="calibration_duration" value="30.0"/>
     <param name="droop_frame_threshold" value="15"/>

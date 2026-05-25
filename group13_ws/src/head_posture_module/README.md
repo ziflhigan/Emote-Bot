@@ -1,10 +1,17 @@
 # Head Posture Module
 
-Module 6: converts MediaPipe pose landmarks into a compact head-posture topic for the focus robot.
+Module 6: runs MediaPipe Pose on the USB camera and publishes compact head-posture evidence for the focus robot (same camera path as `fatigue_monitor`).
 
 ## ROS Contract
 
-Input (on robot — discover with `rostopic info`):
+Input (default):
+
+```text
+/usb_cam/image_raw
+sensor_msgs/Image
+```
+
+Optional external pose (set `use_external_pose:=true`):
 
 ```text
 /mediapipe/pose_landmarks
@@ -45,29 +52,17 @@ source devel/setup.bash
 
 ## Run
 
-Start the camera and MediaPipe pose first, then discover the pose message type:
-
 ```bash
-rostopic list | grep -i pose
-rostopic info /mediapipe/pose_landmarks
-rostopic echo /mediapipe/pose_landmarks -n1
+roslaunch usb_cam usb_cam-test.launch
+roslaunch head_posture_module head_posture_monitor.launch
 ```
 
-Then start this module (replace package and type from `rostopic info`):
+Session-aware recalibration listens on `/focus_robot/session_active` by default (same topic as `fatigue_monitor`).
+
+Optional debug preview window:
 
 ```bash
-roslaunch head_posture_module head_posture_monitor.launch \
-  pose_msg_module:=YOUR_PACKAGE \
-  pose_msg_type:=YOUR_MESSAGE_TYPE
-```
-
-Optional session-aware recalibration when Member 4 publishes `std_msgs/Bool`:
-
-```bash
-roslaunch head_posture_module head_posture_monitor.launch \
-  pose_msg_module:=YOUR_PACKAGE \
-  pose_msg_type:=YOUR_MESSAGE_TYPE \
-  session_active_topic:=/focus_robot/session_active
+roslaunch head_posture_module head_posture_monitor.launch show_window:=true
 ```
 
 ## Test And Screenshots
@@ -75,7 +70,7 @@ roslaunch head_posture_module head_posture_monitor.launch \
 Use these commands for online testing and report screenshots:
 
 ```bash
-rostopic info /mediapipe/pose_landmarks
+rostopic info /usb_cam/image_raw
 rostopic info /head_posture_state
 rostopic echo /head_posture_state
 rostopic hz /head_posture_state
