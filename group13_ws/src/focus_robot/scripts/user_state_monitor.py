@@ -4,7 +4,7 @@ import sys
 
 import rospy
 from opencv_apps.msg import FaceArrayStamped
-from vision_presence_module.msg import UserState
+from focus_robot.msg import UserState
 
 
 class UserStateLogic:

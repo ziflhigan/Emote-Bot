@@ -1,0 +1,32 @@
+# focus_robot ROS parameter server values
+# Load with: rosparam load params.yaml
+# Or reference from launch file: <rosparam file="$(find focus_robot)/config/params.yaml"/>
+
+# ── Module 6: Head Posture ────────────────────────────────────────────────
+head_posture:
+  calibration_duration:    30.0   # seconds to collect upright baseline
+  droop_frame_threshold:   15     # consecutive drooping frames → head_down=True
+  droop_pixel_threshold:   30.0   # pixels below baseline counted as droop
+  min_landmark_visibility: 0.5    # MediaPipe landmark confidence threshold (0–1)
+  image_height:            480.0  # scale factor when coords_normalized=true
+  coords_normalized:       true   # whether pose landmark y coords are 0–1
+
+# ── Module 5: Fatigue Monitor ─────────────────────────────────────────────
+# These mirror the CFG dict in fatigue_monitor.py (node reads CFG directly;
+# values here are for documentation and future rosparam migration)
+fatigue:
+  ear_close_thresh:       0.20   # Eye Aspect Ratio threshold for eye closure
+  perclos_window_secs:    60     # sliding window for PERCLOS calculation
+  perclos_mild:           0.15
+  perclos_moderate:       0.25
+  perclos_severe:         0.35
+  head_pitch_thresh_deg:  -12    # degrees downward for head-down detection
+  head_pitch_confirm_n:   15     # frames to confirm head-down event
+  face_absent_mild_s:     5      # seconds without face → mild fatigue
+  face_absent_moderate_s: 15
+  warmup_secs:            30     # → 600 for real sessions
+  min_intv_gap_secs:      30     # → 300 for real sessions
+  score_mild:             0.30
+  score_moderate:         0.55
+  score_severe:           0.80
+  log_interval_secs:      60

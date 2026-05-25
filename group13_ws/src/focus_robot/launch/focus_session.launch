@@ -1,0 +1,68 @@
+<launch>
+  <!-- ═══════════════════════════════════════════════════════════════
+       focus_session.launch — start all focus_robot nodes
+       Prerequisites (launch separately before this file):
+         roslaunch usb_cam usb_cam-test.launch
+         roslaunch opencv_apps face_detection.launch
+         roslaunch jupiterobot2_voice_ps voice_recognition.launch
+         <mediapipe pose node — check rostopic info /mediapipe/pose_landmarks>
+       ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- ── Module 2: Vision / Presence ──────────────────────────────── -->
+  <node name="user_state_monitor"
+        pkg="focus_robot"
+        type="user_state_monitor.py"
+        output="screen">
+    <param name="face_topic"  value="/face_detection/faces"/>
+    <param name="state_topic" value="/vision_and_presence_detection"/>
+  </node>
+
+  <!-- ── Module 5: Fatigue Monitor ─────────────────────────────────── -->
+  <node name="fatigue_monitor"
+        pkg="focus_robot"
+        type="fatigue_monitor.py"
+        output="screen"/>
+
+  <!-- ── Module 6: Head Posture ─────────────────────────────────────── -->
+  <!--
+    pose_msg_module and pose_msg_type must match the MediaPipe node running
+    on the robot. Discover them with:
+      rostopic info /mediapipe/pose_landmarks
+    Then fill in the values below, e.g.:
+      pose_msg_module: mediapipe_ros
+      pose_msg_type:   Poses
+  -->
+  <node name="head_posture"
+        pkg="focus_robot"
+        type="head_posture.py"
+        output="screen">
+    <param name="pose_topic"             value="/mediapipe/pose_landmarks"/>
+    <param name="state_topic"            value="/head_posture_state"/>
+    <param name="pose_msg_module"        value=""/>
+    <param name="pose_msg_type"          value=""/>
+    <param name="session_active_topic"   value="/focus_robot/session_active"/>
+    <param name="image_height"           value="480"/>
+    <param name="coords_normalized"      value="true"/>
+    <param name="calibration_duration"   value="30.0"/>
+    <param name="droop_frame_threshold"  value="15"/>
+    <param name="droop_pixel_threshold"  value="30.0"/>
+    <param name="min_landmark_visibility" value="0.5"/>
+  </node>
+
+  <!-- ── Module 3: Voice Command (stub) ────────────────────────────── -->
+  <!-- Uncomment when Member 3 implements voice_command.py
+  <node name="voice_command"
+        pkg="focus_robot"
+        type="voice_command.py"
+        output="screen"/>
+  -->
+
+  <!-- ── Module 4: Session Manager (stub) ──────────────────────────── -->
+  <!-- Uncomment when Member 4 implements session_manager.py
+  <node name="session_manager"
+        pkg="focus_robot"
+        type="session_manager.py"
+        output="screen"/>
+  -->
+
+</launch>
