@@ -1,44 +1,78 @@
 #!/usr/bin/env python3
 """
-Fatigue Detection & Intervention — ROS Node
+Fatigue Detection — Data Publisher Node
 Member 5 — fatigue_monitor package
 
-Identical behaviour on VM and robot.
+Role in integrated system:
+  Computes fatigue signals (EAR, PERCLOS, head pitch, face absence).
+  Enriches with Member 2 (user state) and Member 6 (head posture).
+  Publishes all metrics for LLM brain to consume and act on.
+  Does NOT manage sessions — session manager handles that.
+  Does NOT use SoundClient directly — speech_output_module handles TTS.
 
-Run sequence:
-  Terminal 1: roscore
-  Terminal 2: roslaunch usb_cam usb_cam-test.launch
-  Terminal 3: roslaunch jupiterobot2_voice_ps voice_recognition.launch
-              (VM: rostopic pub /recognizer/output std_msgs/String "data: 'move'" --once)
-  Terminal 4: rosrun fatigue_monitor fatigue_node.py
+TTS integration:
+  Default mode:
+    LLM brain subscribes to /focus_robot/fatigue_summary
+    LLM decides when/what to speak
+    LLM publishes speech text to /tts_request
+
+  Standalone fallback mode:
+    Run with _local_tts_enabled:=true
+    This node publishes simple local intervention messages to /tts_request
+
+Subscribes to:
+  /usb_cam/image_raw                 sensor_msgs/Image    own camera pipeline
+  /vision_and_presence_detection     UserState            Member 2
+  /head_posture_state                HeadPosture          Member 6
+  /voice_command                     std_msgs/String      dismiss only
+  /focus_robot/session_active        std_msgs/Bool        from session manager
 
 Publishes:
-  /focus_robot/session_active  std_msgs/Bool
-  /focus_robot/fatigue_level   std_msgs/Int32
-
-Subscribes:
-  /usb_cam/image_raw           sensor_msgs/Image
-  /recognizer/output           std_msgs/String
+  /focus_robot/fatigue_level         std_msgs/Int32       0-3
+  /focus_robot/fatigue_score         std_msgs/Float32     0.0-1.0
+  /focus_robot/ear                   std_msgs/Float32     eye aspect ratio
+  /focus_robot/perclos               std_msgs/Float32     0.0-1.0
+  /focus_robot/head_pitch_deg        std_msgs/Float32     degrees
+  /focus_robot/face_absent_secs      std_msgs/Float32     seconds
+  /focus_robot/fatigue_summary       std_msgs/String      JSON — for LLM
+  /tts_request                       std_msgs/String      speech request to TTS module
 """
 
 import os
-import rospy
-import cv2
-import mediapipe as mp
-import numpy as np
+import json
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 
-from std_msgs.msg import Bool, Int32, String
-from sensor_msgs.msg import Image
+import cv2
+import mediapipe as mp
+import numpy as np
+import rospy
 from cv_bridge import CvBridge
-from sound_play.libsoundplay import SoundClient
+from sensor_msgs.msg import Image
+from std_msgs.msg import Bool, Float32, Int32, String
 
-# ─────────────────────────────────────────────────────────
+
+# ── Member 2 import ───────────────────────────────────────────────────────
+try:
+    from vision_presence_module.msg import UserState
+    _M2_OK = True
+except ImportError:
+    _M2_OK = False
+
+
+# ── Member 6 import ───────────────────────────────────────────────────────
+try:
+    from head_posture_module.msg import HeadPosture
+    _M6_OK = True
+except ImportError:
+    _M6_OK = False
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 CFG = {
     "EAR_CLOSE_THRESH"      : 0.20,
     "PERCLOS_WINDOW_SECS"   : 60,
@@ -49,17 +83,19 @@ CFG = {
     "HEAD_PITCH_CONFIRM_N"  : 15,
     "FACE_ABSENT_MILD_S"    : 5,
     "FACE_ABSENT_MODERATE_S": 15,
-    "WARMUP_SECS"           : 30,    # → 600 for real sessions
-    "MIN_INTV_GAP_SECS"     : 30,    # → 300 for real sessions
     "SCORE_MILD"            : 0.30,
     "SCORE_MODERATE"        : 0.55,
     "SCORE_SEVERE"          : 0.80,
     "LOG_INTERVAL_SECS"     : 60,
+
+    # Time multiplier breakpoints
+    "TIME_MUL_20MIN"        : 1.0,
+    "TIME_MUL_40MIN"        : 1.3,
+    "TIME_MUL_60PLUS"       : 1.6,
 }
 
-# ─────────────────────────────────────────────────────────
-# LANDMARK INDICES
-# ─────────────────────────────────────────────────────────
+
+# ── Landmark indices ──────────────────────────────────────────────────────
 LEFT_EYE  = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 HEAD_LM   = [4, 152, 33, 263, 61, 291]
@@ -73,12 +109,24 @@ FACE_3D = np.array([
     ( 150.0, -150.0,-125.0),
 ], dtype=np.float64)
 
-LEVEL_LABEL = {0:"ALERT", 1:"MILD", 2:"MODERATE", 3:"SEVERE"}
-LEVEL_COLOR = {0:(0,200,0), 1:(0,200,200), 2:(0,140,255), 3:(0,0,220)}
+LEVEL_LABEL = {
+    0: "ALERT",
+    1: "MILD",
+    2: "MODERATE",
+    3: "SEVERE",
+}
 
-# ─────────────────────────────────────────────────────────
+LEVEL_COLOR = {
+    0: (0, 200, 0),
+    1: (0, 200, 200),
+    2: (0, 140, 255),
+    3: (0, 0, 220),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # DATA CLASSES
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 @dataclass
 class Metrics:
     ear_avg         : float = 0.0
@@ -89,33 +137,59 @@ class Metrics:
     fatigue_score   : float = 0.0
     fatigue_level   : int   = 0
 
+
 @dataclass
-class Session:
+class SessionState:
     active      : bool  = False
     start_time  : float = 0.0
     elapsed_secs: float = 0.0
-    warmup_done : bool  = False
 
-# ─────────────────────────────────────────────────────────
+
+@dataclass
+class M2State:
+    """Data received from Member 2 user_state_monitor."""
+    user_present             : bool = False
+    consecutive_eyes_missing : int  = 0
+    consecutive_face_absent  : int  = 0
+    received                 : bool = False
+
+
+@dataclass
+class M6State:
+    """Data received from Member 6 head_posture_node."""
+    pose_visible    : bool  = False
+    calibrated      : bool  = False
+    head_down       : bool  = False
+    posture_score   : float = 0.0
+    received        : bool  = False
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # MAIN CLASS
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 class FatigueMonitor:
 
+    LOCAL_TTS_MESSAGES = {
+        1: "Working hard. Remember to rest your eyes.",
+        2: "Losing focus. A short break might help.",
+        3: "You look quite tired. Consider taking a break.",
+    }
+
     def __init__(self):
-        rospy.init_node('fatigue_monitor', anonymous=False)
+        rospy.init_node("fatigue_monitor", anonymous=False)
         rospy.on_shutdown(self.cleanup)
         rospy.loginfo("FatigueMonitor: initialising...")
 
-        # Sound client — same pattern as say_hello_ans.py
-        self.soundhandle = SoundClient()
-        rospy.sleep(1)
-        self.soundhandle.stopAll()
-        rospy.loginfo("FatigueMonitor: sound_play ready")
+        rospy.loginfo(
+            "Member 2 (UserState) import: %s",
+            "OK" if _M2_OK else "MISSING — vision_presence_module not found"
+        )
+        rospy.loginfo(
+            "Member 6 (HeadPosture) import: %s",
+            "OK" if _M6_OK else "MISSING — head_posture_module not found"
+        )
 
-        # CvBridge
-        self.bridge = CvBridge()
-
-        # MediaPipe FaceMesh
+        # ── MediaPipe FaceMesh ────────────────────────────────────────────
         mp_fm = mp.solutions.face_mesh
         self.face_mesh = mp_fm.FaceMesh(
             max_num_faces=1,
@@ -126,51 +200,249 @@ class FatigueMonitor:
         self.mp_draw = mp.solutions.drawing_utils
         self.mp_fm   = mp_fm
 
-        # State
-        self.m = Metrics()
-        self.s = Session()
+        # ── CvBridge ──────────────────────────────────────────────────────
+        self.bridge  = CvBridge()
+        self.cam_mat = None
+        self.dist    = np.zeros((4, 1), dtype=np.float64)
+
+        # ── Internal state ────────────────────────────────────────────────
+        self.m   = Metrics()
+        self.s   = SessionState()
+        self.m2  = M2State()
+        self.m6  = M6State()
 
         self.perclos_buf         : deque = deque()
         self.last_face_time      : float = time.time()
         self.face_present        : bool  = False
-        self.last_intv_time      : float = 0.0
-        self.intv_text           : str   = ""
-        self.intv_show_until     : float = 0.0
         self.last_metric_log_time: float = 0.0
-        self.cam_mat                     = None
-        self.dist = np.zeros((4, 1), dtype=np.float64)
 
-        # Log file — home dir resolved at runtime
+        # Overlay message. Used by local fallback TTS and dismiss.
+        self.overlay_msg   : str   = ""
+        self.overlay_until : float = 0.0
+
+        # ── Local TTS fallback config ─────────────────────────────────────
+        self.local_tts = rospy.get_param("~local_tts_enabled", False)
+        self.last_intv_time      : float = 0.0
+        self.session_warmup_done : bool  = False
+        self.WARMUP_SECS  = float(rospy.get_param("~warmup_secs", 30.0))
+        self.MIN_INTV_GAP = float(rospy.get_param("~min_intv_gap_secs", 30.0))
+
+        rospy.loginfo(
+            "FatigueMonitor: local_tts_enabled=%s "
+            "(LLM handles interventions when False)",
+            self.local_tts
+        )
+
+        # ── Log file ──────────────────────────────────────────────────────
         log_name = datetime.now().strftime("fatigue_log_%Y%m%d_%H%M%S.txt")
         self.log_path = os.path.join(os.path.expanduser("~"), log_name)
         self._init_log()
-        rospy.loginfo(f"FatigueMonitor: logging to {self.log_path}")
+        rospy.loginfo("FatigueMonitor: logging to %s", self.log_path)
 
-        # Publishers
-        self.pub_active = rospy.Publisher(
-            '/focus_robot/session_active', Bool,  queue_size=1)
-        self.pub_level  = rospy.Publisher(
-            '/focus_robot/fatigue_level',  Int32, queue_size=1)
+        # ── Publishers ────────────────────────────────────────────────────
+        self.pub_level   = rospy.Publisher(
+            "/focus_robot/fatigue_level", Int32, queue_size=1)
+        self.pub_score   = rospy.Publisher(
+            "/focus_robot/fatigue_score", Float32, queue_size=1)
+        self.pub_ear     = rospy.Publisher(
+            "/focus_robot/ear", Float32, queue_size=1)
+        self.pub_perclos = rospy.Publisher(
+            "/focus_robot/perclos", Float32, queue_size=1)
+        self.pub_pitch   = rospy.Publisher(
+            "/focus_robot/head_pitch_deg", Float32, queue_size=1)
+        self.pub_absent  = rospy.Publisher(
+            "/focus_robot/face_absent_secs", Float32, queue_size=1)
 
-        # Subscribers
+        # JSON summary — primary input for LLM brain node
+        self.pub_summary = rospy.Publisher(
+            "/focus_robot/fatigue_summary", String, queue_size=1)
+
+        # TTS request — handled by speech_output_module
+        self.pub_tts = rospy.Publisher(
+            "/tts_request", String, queue_size=10)
+
+        # ── Subscribers ───────────────────────────────────────────────────
         rospy.Subscriber(
-            '/usb_cam/image_raw', Image, self._image_callback)
+            "/usb_cam/image_raw", Image, self._image_callback)
+
+        session_topic = rospy.get_param(
+            "~session_active_topic", "/focus_robot/session_active")
         rospy.Subscriber(
-            '/recognizer/output', String, self._voice_callback)
+            session_topic, Bool, self._session_callback)
+        rospy.loginfo("FatigueMonitor: session topic = %s", session_topic)
 
-        rospy.loginfo("FatigueMonitor: ready — say MOVE to start")
+        # Voice command module — dismiss only
+        rospy.Subscriber(
+            "/voice_command", String, self._voice_callback)
 
-    # ──────────────────────────────────────
+        # Member 2 — user state monitor
+        if _M2_OK:
+            rospy.Subscriber(
+                "/vision_and_presence_detection",
+                UserState,
+                self._m2_callback
+            )
+            rospy.loginfo(
+                "FatigueMonitor: subscribed to /vision_and_presence_detection")
+        else:
+            rospy.logwarn(
+                "FatigueMonitor: Member 2 unavailable — "
+                "running without UserState data")
+
+        # Member 6 — head posture monitor
+        if _M6_OK:
+            m6_topic = rospy.get_param(
+                "~head_posture_topic", "/head_posture_state")
+            rospy.Subscriber(
+                m6_topic,
+                HeadPosture,
+                self._m6_callback
+            )
+            rospy.loginfo(
+                "FatigueMonitor: subscribed to %s", m6_topic)
+        else:
+            rospy.logwarn(
+                "FatigueMonitor: Member 6 unavailable — "
+                "running without body posture data")
+
+        rospy.loginfo(
+            "FatigueMonitor: ready — waiting for session_active signal")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # MEMBER 2 CALLBACK
+    # ──────────────────────────────────────────────────────────────────────
+    def _m2_callback(self, msg):
+        """Receives UserState from Member 2 user_state_monitor."""
+        self.m2.user_present             = msg.user_present
+        self.m2.consecutive_eyes_missing = msg.consecutive_eyes_missing
+        self.m2.consecutive_face_absent  = msg.consecutive_face_absent
+        self.m2.received                 = True
+
+    # ──────────────────────────────────────────────────────────────────────
+    # MEMBER 6 CALLBACK
+    # ──────────────────────────────────────────────────────────────────────
+    def _m6_callback(self, msg):
+        """Receives HeadPosture from Member 6 head_posture_monitor."""
+        self.m6.pose_visible  = msg.pose_visible
+        self.m6.calibrated    = msg.calibrated
+        self.m6.head_down     = msg.head_down
+        self.m6.posture_score = msg.posture_score
+        self.m6.received      = True
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TTS REQUEST HELPER
+    # ──────────────────────────────────────────────────────────────────────
+    def _say(self, text: str):
+        """
+        Publish speech request to /tts_request.
+        speech_output_module handles SoundClient/sound_play and deduplication.
+        """
+        if not text:
+            return
+
+        self.pub_tts.publish(String(data=text))
+        rospy.loginfo("TTS request: %r", text)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # LOCAL TTS FALLBACK
+    # ──────────────────────────────────────────────────────────────────────
+    def _try_local_tts(self):
+        """
+        Fallback intervention path used only when local_tts_enabled=True.
+
+        Default mode:
+          LLM brain subscribes to /focus_robot/fatigue_summary and decides
+          when/what to publish to /tts_request.
+
+        Standalone mode:
+          This node generates simple interventions itself.
+        """
+        level = self.m.fatigue_level
+        if level == 0:
+            return
+
+        now = time.time()
+        if now - self.last_intv_time < self.MIN_INTV_GAP:
+            return
+
+        msg = self.LOCAL_TTS_MESSAGES.get(level)
+        if not msg:
+            return
+
+        self._say(msg)
+
+        self.overlay_msg    = msg
+        self.overlay_until  = now + 5.0
+        self.last_intv_time = now
+        self._write_log("LOCAL_TTS")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # SESSION CALLBACK — from session manager / LLM
+    # ──────────────────────────────────────────────────────────────────────
+    def _session_callback(self, msg):
+        """
+        Receives Bool from session manager.
+        True  = session started, begin fatigue monitoring.
+        False = session ended, pause monitoring.
+        """
+        was_active = self.s.active
+        self.s.active = msg.data
+
+        if msg.data and not was_active:
+            self.s.start_time    = time.time()
+            self.s.elapsed_secs  = 0.0
+            self.session_warmup_done = False
+            self.last_metric_log_time = 0.0
+            self.last_intv_time = 0.0
+            self.perclos_buf.clear()
+
+            self._write_event("SESSION START — received from session manager")
+            rospy.loginfo("[SESSION] Started — fatigue monitoring active")
+
+        elif not msg.data and was_active:
+            mins = int(self.s.elapsed_secs / 60)
+            self.session_warmup_done = False
+
+            self._write_event(
+                f"SESSION END — elapsed {mins}min "
+                f"final score {self.m.fatigue_score:.2f}"
+            )
+            rospy.loginfo("[SESSION] Ended — %d minutes elapsed", mins)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # VOICE CALLBACK — dismiss only
+    # ──────────────────────────────────────────────────────────────────────
+    def _voice_callback(self, msg):
+        """
+        Only handles 'dismiss' from the voice module.
+        All other commands are handled by the session manager.
+        """
+        cmd = msg.data.strip().lower()
+
+        if cmd == "dismiss":
+            self.overlay_msg   = ""
+            self.overlay_until = 0.0
+            self._write_event("USER DISMISSED alert")
+            self._say("Noted.")
+            rospy.loginfo("[VOICE] Dismiss received — overlay cleared")
+        else:
+            rospy.logdebug(
+                "FatigueMonitor received voice cmd '%s' — "
+                "session manager handles session commands",
+                cmd
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
     # IMAGE CALLBACK
-    # ──────────────────────────────────────
-
+    # ──────────────────────────────────────────────────────────────────────
     def _image_callback(self, msg):
         if self.face_mesh is None:
             return
+
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
-            rospy.logwarn(f"CvBridge error: {e}")
+            rospy.logwarn_throttle(5.0, "CvBridge error: %s", e)
             return
 
         frame = cv2.flip(frame, 1)
@@ -178,107 +450,73 @@ class FatigueMonitor:
         if self.cam_mat is None:
             fh, fw = frame.shape[:2]
             self.cam_mat = np.array([
-                [fw,  0, fw/2],
-                [ 0, fw, fh/2],
-                [ 0,  0,    1]
+                [fw,  0, fw / 2],
+                [ 0, fw, fh / 2],
+                [ 0,  0,      1],
             ], dtype=np.float64)
 
         frame = self._process(frame)
         frame = self._draw(frame)
+
         cv2.imshow("Fatigue Monitor", frame)
         cv2.waitKey(1)
 
-    # ──────────────────────────────────────
-    # VOICE CALLBACK
-    # ──────────────────────────────────────
-
-    def _voice_callback(self, msg):
-        """
-        Receives from /recognizer/output (pocketsphinx).
-        Matches on last word only — pocketsphinx accumulates words
-        in the same string e.g. "half stop move move back stop".
-
-        Supported vocabulary (existing pocketsphinx dictionary):
-          MOVE → start session
-          STOP → end session
-        """
-        words = msg.data.upper().split()
-        if not words:
-            return
-
-        last = words[-1]
-        rospy.loginfo(f"Voice: '{msg.data}' → last='{last}'")
-
-        if last == "MOVE" and not self.s.active:
-            self._start_session()
-        elif last == "STOP" and self.s.active:
-            self._stop_session()
-
-    def _start_session(self):
-        self.s.active             = True
-        self.s.start_time         = time.time()
-        self.s.elapsed_secs       = 0.0
-        self.s.warmup_done        = False
-        self.last_metric_log_time = 0.0
-        rospy.loginfo("[SESSION] Started")
-        self._write_event("SESSION START")
-        self.soundhandle.say(
-            "Focus session started. I will check in with you.")
-
-    def _stop_session(self):
-        mins = int(self.s.elapsed_secs / 60)
-        rospy.loginfo(f"[SESSION] Stopped after {mins} minutes")
-        self._write_event(
-            f"SESSION STOP | final score {self.m.fatigue_score:.2f}")
-        self.soundhandle.say(
-            f"Session ended. You focused for {mins} minutes. Good work.")
-        self.s.active = False
-        self.pub_active.publish(Bool(data=False))
-
-    # ──────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
     # SIGNAL CALCULATIONS
-    # ──────────────────────────────────────
-
+    # ──────────────────────────────────────────────────────────────────────
     def _ear(self, pts: np.ndarray) -> float:
         v1 = np.linalg.norm(pts[1] - pts[5])
         v2 = np.linalg.norm(pts[2] - pts[4])
         h  = np.linalg.norm(pts[0] - pts[3])
+
         return (v1 + v2) / (2.0 * h + 1e-6)
 
     def _eye_pts(self, lm, idx, w, h) -> np.ndarray:
         return np.array(
             [(lm[i].x * w, lm[i].y * h) for i in idx],
-            dtype=np.float64)
+            dtype=np.float64
+        )
 
     def _update_perclos(self, is_closed: bool) -> float:
         now = time.time()
         self.perclos_buf.append((now, is_closed))
+
         cutoff = now - CFG["PERCLOS_WINDOW_SECS"]
         while self.perclos_buf and self.perclos_buf[0][0] < cutoff:
             self.perclos_buf.popleft()
+
         if len(self.perclos_buf) < 5:
             return 0.0
-        return sum(1 for _, c in self.perclos_buf if c) / len(
-            self.perclos_buf)
+
+        return sum(1 for _, closed in self.perclos_buf if closed) / len(
+            self.perclos_buf
+        )
 
     def _head_pitch(self, lm, w, h) -> float:
         if self.cam_mat is None:
             return 0.0
+
         pts_2d = np.array(
             [(lm[i].x * w, lm[i].y * h) for i in HEAD_LM],
-            dtype=np.float64)
+            dtype=np.float64
+        )
+
         ok, rvec, _ = cv2.solvePnP(
-            FACE_3D, pts_2d, self.cam_mat, self.dist,
-            flags=cv2.SOLVEPNP_ITERATIVE)
+            FACE_3D,
+            pts_2d,
+            self.cam_mat,
+            self.dist,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+
         if not ok:
             return 0.0
+
         rmat, _ = cv2.Rodrigues(rvec)
         angles, *_ = cv2.RQDecomp3x3(rmat)
         pitch = angles[0]
 
-        # Fix PnP flip ambiguity
-        # If pitch is near ±180 the solution flipped to back-of-head
-        # Correct by subtracting 180 and flipping sign
+        # Flip ambiguity correction.
         if pitch > 90:
             pitch = pitch - 180
         elif pitch < -90:
@@ -288,60 +526,118 @@ class FatigueMonitor:
 
     def _time_multiplier(self) -> float:
         mins = self.s.elapsed_secs / 60
-        if mins < 20: return 1.0
-        if mins < 40: return 1.3
-        return 1.6
 
+        if mins < 20:
+            return CFG["TIME_MUL_20MIN"]
+        if mins < 40:
+            return CFG["TIME_MUL_40MIN"]
+        return CFG["TIME_MUL_60PLUS"]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FATIGUE SCORE — integrates own signals, M2, and updated M6 logic
+    # ──────────────────────────────────────────────────────────────────────
     def _compute_score(self) -> float:
         m = self.m
+
+        # ── PERCLOS (50% weight) ──────────────────────────────────────────
+        # Primary eye-based fatigue signal.
         perclos_n = min(m.perclos / (CFG["PERCLOS_SEVERE"] + 1e-6), 1.0)
-        head_n    = min(
-            m.head_down_frames / CFG["HEAD_PITCH_CONFIRM_N"], 1.0)
-        absent_n  = min(
-            m.face_absent_secs / CFG["FACE_ABSENT_MODERATE_S"], 1.0)
-        raw = (perclos_n * 0.50 +
-               head_n    * 0.30 +
-               absent_n  * 0.20)
+
+        # ── Head signal (30% weight) ──────────────────────────────────────
+        #
+        # Two independent measurements:
+        #
+        # 1. Our face-mesh pitch:
+        #    Measures angular head tilt using face landmarks.
+        #    Works when only the face is visible.
+        #
+        # 2. M6 head posture:
+        #    Measures physical body droop using MediaPipe Pose:
+        #    ratio = nose_y - shoulder_midpoint_y
+        #    posture_score = droop_amount / 100.0
+        #
+        # M6 is valid only when:
+        #   pose_visible=True
+        #   calibrated=True
+        #
+        # If M6 head_down=True, it means sustained droop was detected.
+        # If M6 head_down=False, posture_score may be transient leaning,
+        # so its effect is attenuated.
+        face_pitch_n = min(
+            m.head_down_frames / CFG["HEAD_PITCH_CONFIRM_N"], 1.0
+        )
+
+        if (self.m6.received
+                and self.m6.calibrated
+                and self.m6.pose_visible):
+
+            if self.m6.head_down:
+                # Confirmed sustained body droop.
+                m6_head_n = self.m6.posture_score
+            else:
+                # Possible transient lean, reduce its effect.
+                m6_head_n = self.m6.posture_score * 0.35
+
+            # Use stronger signal because M6 body droop and our face pitch
+            # measure different physical fatigue cues.
+            head_n = min(max(m6_head_n, face_pitch_n), 1.0)
+
+            rospy.logdebug_throttle(
+                5.0,
+                "head_n=%.2f (m6=%.2f head_down=%s, face=%.2f)",
+                head_n,
+                m6_head_n,
+                self.m6.head_down,
+                face_pitch_n
+            )
+
+        else:
+            # M6 missing, not calibrated, or pose not visible.
+            # Fall back to our own face-mesh pitch only.
+            head_n = face_pitch_n
+
+            if self.m6.received and not self.m6.calibrated:
+                rospy.logdebug_throttle(
+                    10.0,
+                    "M6 still calibrating — using face pitch only"
+                )
+
+        # ── Face absence (20% weight) ─────────────────────────────────────
+        absent_n = min(
+            m.face_absent_secs / CFG["FACE_ABSENT_MODERATE_S"], 1.0
+        )
+
+        # If M2 also confirms face absence, boost slightly.
+        if self.m2.received and self.m2.consecutive_face_absent > 10:
+            absent_n = min(absent_n * 1.2, 1.0)
+
+        # ── Weighted sum with time scaling ────────────────────────────────
+        raw = (
+            perclos_n * 0.50 +
+            head_n    * 0.30 +
+            absent_n  * 0.20
+        )
+
         return min(raw * self._time_multiplier(), 1.0)
 
     def _score_to_level(self, score: float) -> int:
-        if score >= CFG["SCORE_SEVERE"]:   return 3
-        if score >= CFG["SCORE_MODERATE"]: return 2
-        if score >= CFG["SCORE_MILD"]:     return 1
+        if score >= CFG["SCORE_SEVERE"]:
+            return 3
+        if score >= CFG["SCORE_MODERATE"]:
+            return 2
+        if score >= CFG["SCORE_MILD"]:
+            return 1
         return 0
 
-    # ──────────────────────────────────────
-    # INTERVENTION
-    # ──────────────────────────────────────
-
-    MESSAGES = {
-        1: "Working hard. Remember to rest your eyes.",
-        2: "Losing focus. A short break might help.",
-        3: "You look quite tired. Consider taking a break.",
-    }
-
-    def _try_intervene(self):
-        level = self.m.fatigue_level
-        if level == 0 or not self.s.warmup_done:
-            return
-        if time.time() - self.last_intv_time < CFG["MIN_INTV_GAP_SECS"]:
-            return
-        msg = self.MESSAGES[level]
-        self.soundhandle.say(msg)
-        rospy.loginfo(f"[{LEVEL_LABEL[level]}] {msg}")
-        self.intv_text       = msg
-        self.intv_show_until = time.time() + 5.0
-        self.last_intv_time  = time.time()
-        self._write_log("INTERVENTION")
-
-    # ──────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
     # FRAME PROCESSING
-    # ──────────────────────────────────────
-
+    # ──────────────────────────────────────────────────────────────────────
     def _process(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
         result = self.face_mesh.process(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        )
+
         m   = self.m
         now = time.time()
 
@@ -349,6 +645,7 @@ class FatigueMonitor:
             self.face_present   = True
             self.last_face_time = now
             m.face_absent_secs  = 0.0
+
             lm = result.multi_face_landmarks[0].landmark
 
             self.mp_draw.draw_landmarks(
@@ -357,202 +654,407 @@ class FatigueMonitor:
                 self.mp_fm.FACEMESH_CONTOURS,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=self.mp_draw.DrawingSpec(
-                    color=(60,120,10), thickness=1, circle_radius=1))
+                    color=(60, 120, 10),
+                    thickness=1,
+                    circle_radius=1
+                )
+            )
 
             l_pts = self._eye_pts(lm, LEFT_EYE,  w, h)
             r_pts = self._eye_pts(lm, RIGHT_EYE, w, h)
-            m.ear_avg    = (self._ear(l_pts) + self._ear(r_pts)) / 2.0
-            m.perclos    = self._update_perclos(
-                m.ear_avg < CFG["EAR_CLOSE_THRESH"])
+
+            m.ear_avg = (self._ear(l_pts) + self._ear(r_pts)) / 2.0
+            m.perclos = self._update_perclos(
+                m.ear_avg < CFG["EAR_CLOSE_THRESH"]
+            )
             m.head_pitch = self._head_pitch(lm, w, h)
 
             if m.head_pitch < CFG["HEAD_PITCH_THRESH_DEG"]:
                 m.head_down_frames += 1
             else:
                 m.head_down_frames = max(0, m.head_down_frames - 1)
+
         else:
             self.face_present   = False
             m.face_absent_secs  = now - self.last_face_time
             m.head_down_frames  = max(0, m.head_down_frames - 1)
+
             self._update_perclos(False)
 
+        # Session elapsed and warmup tracking.
         if self.s.active:
             self.s.elapsed_secs = now - self.s.start_time
-            self.s.warmup_done  = (
-                self.s.elapsed_secs > CFG["WARMUP_SECS"])
+            self.session_warmup_done = (
+                self.s.elapsed_secs > self.WARMUP_SECS
+            )
 
+        # Score and level.
         m.fatigue_score = self._compute_score()
         m.fatigue_level = self._score_to_level(m.fatigue_score)
 
-        self.pub_active.publish(Bool(data=self.s.active))
-        self.pub_level.publish(Int32(data=m.fatigue_level))
+        # Publish all metrics every frame.
+        self._publish_all()
 
-        if self.s.active:
-            self._try_intervene()
-            if (self.s.warmup_done and
-                    now - self.last_metric_log_time
-                    >= CFG["LOG_INTERVAL_SECS"]):
-                self._write_log("METRIC")
-                self.last_metric_log_time = now
+        # Local TTS fallback only.
+        if self.s.active and self.local_tts and self.session_warmup_done:
+            self._try_local_tts()
+
+        # Periodic logging.
+        if (self.s.active and
+                now - self.last_metric_log_time >= CFG["LOG_INTERVAL_SECS"]):
+            self._write_log("METRIC")
+            self.last_metric_log_time = now
 
         return frame
 
-    # ──────────────────────────────────────
-    # DISPLAY OVERLAY
-    # ──────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # PUBLISH ALL METRICS
+    # ──────────────────────────────────────────────────────────────────────
+    def _publish_all(self):
+        """
+        Publishes individual metric topics and JSON summary.
+        LLM brain subscribes to /focus_robot/fatigue_summary for all data.
+        """
+        m = self.m
 
+        self.pub_level.publish(Int32(data=m.fatigue_level))
+        self.pub_score.publish(Float32(data=m.fatigue_score))
+        self.pub_ear.publish(Float32(data=m.ear_avg))
+        self.pub_perclos.publish(Float32(data=m.perclos))
+        self.pub_pitch.publish(Float32(data=m.head_pitch))
+        self.pub_absent.publish(Float32(data=m.face_absent_secs))
+
+        summary = {
+            # Core fatigue assessment
+            "fatigue_level"      : m.fatigue_level,
+            "fatigue_label"      : LEVEL_LABEL[m.fatigue_level],
+            "fatigue_score"      : round(m.fatigue_score, 3),
+            "time_multiplier"    : self._time_multiplier(),
+
+            # Own camera signals
+            "ear"                : round(m.ear_avg, 3),
+            "perclos"            : round(m.perclos, 3),
+            "head_pitch_deg"     : round(m.head_pitch, 1),
+            "head_down_frames"   : m.head_down_frames,
+            "face_absent_secs"   : round(m.face_absent_secs, 1),
+            "face_present"       : self.face_present,
+
+            # Member 2 data
+            "m2_available"                : self.m2.received,
+            "m2_user_present"             : self.m2.user_present,
+            "m2_consecutive_eyes_missing" : self.m2.consecutive_eyes_missing,
+            "m2_consecutive_face_absent"  : self.m2.consecutive_face_absent,
+
+            # Member 6 data
+            "m6_available"      : self.m6.received,
+            "m6_calibrated"     : self.m6.calibrated,
+            "m6_pose_visible"   : self.m6.pose_visible,
+            "m6_head_down"      : self.m6.head_down,
+            "m6_posture_score"  : round(self.m6.posture_score, 3),
+
+            # Session info
+            "session_active"    : self.s.active,
+            "elapsed_secs"      : round(self.s.elapsed_secs, 0),
+            "elapsed_mins"      : round(self.s.elapsed_secs / 60, 1),
+
+            # TTS mode info
+            "local_tts_enabled" : self.local_tts,
+            "tts_topic"         : "/tts_request",
+        }
+
+        self.pub_summary.publish(String(data=json.dumps(summary)))
+
+    # ──────────────────────────────────────────────────────────────────────
+    # DISPLAY OVERLAY
+    # ──────────────────────────────────────────────────────────────────────
     def _bar(self, frame, x, y, bw, bh, ratio, color):
         ratio = max(0.0, min(ratio, 1.0))
-        cv2.rectangle(frame, (x,y), (x+bw, y+bh), (50,50,50), -1)
+
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), (50, 50, 50), -1)
+
         if ratio > 0:
             cv2.rectangle(
-                frame, (x,y), (x+int(bw*ratio), y+bh), color, -1)
+                frame,
+                (x, y),
+                (x + int(bw * ratio), y + bh),
+                color,
+                -1
+            )
 
     def _txt(self, frame, text, y,
-             color=(200,200,200), scale=0.52, bold=False):
-        cv2.putText(frame, text, (8, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, scale,
-                    color, 2 if bold else 1, cv2.LINE_AA)
+             color=(200, 200, 200), scale=0.50, bold=False):
+        cv2.putText(
+            frame,
+            text,
+            (8, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            2 if bold else 1,
+            cv2.LINE_AA
+        )
+
+    def _status_dot(self, frame, x, y, ok):
+        color = (0, 200, 0) if ok else (60, 60, 60)
+        cv2.circle(frame, (x, y), 5, color, -1)
 
     def _draw(self, frame: np.ndarray) -> np.ndarray:
-        h, w = frame.shape[:2]
-        m   = self.m
-        s   = self.s
-        now = time.time()
-        lvl = m.fatigue_level
-        col = LEVEL_COLOR[lvl]
+        h, w  = frame.shape[:2]
+        m     = self.m
+        s     = self.s
+        now   = time.time()
+        lvl   = m.fatigue_level
+        col   = LEVEL_COLOR[lvl]
 
-        cv2.rectangle(frame, (0,0), (w-1, h-1), col, 10)
-        cv2.rectangle(frame, (0,0), (255, h), (0,0,0), -1)
-        cv2.line(frame, (255,0), (255, h), (50,50,50), 1)
+        # Border colour = fatigue level.
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), col, 10)
 
-        # Session
-        self._txt(frame, "SESSION", 24, (255,255,255), 0.58, True)
+        # Dark left panel.
+        cv2.rectangle(frame, (0, 0), (270, h), (0, 0, 0), -1)
+        cv2.line(frame, (270, 0), (270, h), (50, 50, 50), 1)
+
+        # Session.
+        self._txt(frame, "SESSION", 22, (255, 255, 255), 0.55, True)
+
         if s.active:
             mm = int(s.elapsed_secs // 60)
             ss = int(s.elapsed_secs  % 60)
-            self._txt(frame, f"  {mm:02d}:{ss:02d} elapsed",
-                      46, (0,220,0))
-            wl = max(0, CFG["WARMUP_SECS"] - s.elapsed_secs)
-            if wl > 0:
-                self._txt(frame, f"  Warmup: {int(wl)}s",
-                          66, (180,180,0))
-            else:
-                self._txt(frame, "  Monitoring ACTIVE",
-                          66, (0,220,120))
+            self._txt(frame, f"  {mm:02d}:{ss:02d} elapsed", 42, (0, 220, 0))
+            self._txt(frame, "  Monitoring ACTIVE", 60, (0, 220, 120))
         else:
-            self._txt(frame, "  Say MOVE to start",
-                      46, (120,120,120))
+            self._txt(frame, "  Waiting for session", 42, (120, 120, 120))
+            self._txt(
+                frame,
+                "  (session manager controls)",
+                60,
+                (80, 80, 80),
+                0.40
+            )
 
-        cv2.line(frame, (0,80), (255,80), (50,50,50), 1)
+        cv2.line(frame, (0, 72), (270, 72), (50, 50, 50), 1)
 
-        # Metrics
-        self._txt(frame, "METRICS", 100, (255,255,255), 0.55, True)
+        # Own metrics.
+        self._txt(frame, "OUR SIGNALS", 90, (255, 255, 255), 0.52, True)
 
-        ear_col = (0,80,255) \
-            if m.ear_avg < CFG["EAR_CLOSE_THRESH"] else (0,200,100)
-        self._txt(frame, f"  EAR      {m.ear_avg:.3f}", 122, ear_col)
-        self._bar(frame, 8, 127, 238, 7, m.ear_avg/0.40, (0,180,100))
+        ear_col = (
+            (0, 80, 255)
+            if m.ear_avg < CFG["EAR_CLOSE_THRESH"]
+            else (0, 200, 100)
+        )
+        self._txt(frame, f"  EAR      {m.ear_avg:.3f}", 110, ear_col)
+        self._bar(frame, 8, 115, 252, 6, m.ear_avg / 0.40, (0, 180, 100))
 
-        pc_col = (0,80,255) \
-            if m.perclos > CFG["PERCLOS_MILD"] else (0,200,100)
-        self._txt(frame, f"  PERCLOS  {m.perclos*100:.1f}%",
-                  152, pc_col)
-        self._bar(frame, 8, 157, 238, 7,
-                  m.perclos/(CFG["PERCLOS_SEVERE"]+1e-6), (0,120,210))
+        pc_col = (
+            (0, 80, 255)
+            if m.perclos > CFG["PERCLOS_MILD"]
+            else (0, 200, 100)
+        )
+        self._txt(frame, f"  PERCLOS  {m.perclos * 100:.1f}%", 135, pc_col)
+        self._bar(
+            frame,
+            8,
+            140,
+            252,
+            6,
+            m.perclos / (CFG["PERCLOS_SEVERE"] + 1e-6),
+            (0, 120, 210)
+        )
 
-        pt_col = (0,80,255) \
-            if m.head_pitch < CFG["HEAD_PITCH_THRESH_DEG"] \
-            else (0,200,100)
-        self._txt(frame, f"  Pitch    {m.head_pitch:.1f} deg",
-                  182, pt_col)
-        self._bar(frame, 8, 187, 238, 7,
-                  m.head_down_frames/CFG["HEAD_PITCH_CONFIRM_N"],
-                  (0,150,210))
+        pt_col = (
+            (0, 80, 255)
+            if m.head_pitch < CFG["HEAD_PITCH_THRESH_DEG"]
+            else (0, 200, 100)
+        )
+        self._txt(frame, f"  Pitch    {m.head_pitch:.1f} deg", 160, pt_col)
+        self._bar(
+            frame,
+            8,
+            165,
+            252,
+            6,
+            m.head_down_frames / CFG["HEAD_PITCH_CONFIRM_N"],
+            (0, 150, 210)
+        )
 
-        ab_col = (0,80,255) \
-            if m.face_absent_secs > CFG["FACE_ABSENT_MILD_S"] \
-            else (0,200,100)
-        self._txt(frame, f"  Absent   {m.face_absent_secs:.1f}s",
-                  212, ab_col)
-        self._bar(frame, 8, 217, 238, 7,
-                  m.face_absent_secs/CFG["FACE_ABSENT_MODERATE_S"],
-                  (0,160,180))
+        ab_col = (
+            (0, 80, 255)
+            if m.face_absent_secs > CFG["FACE_ABSENT_MILD_S"]
+            else (0, 200, 100)
+        )
+        self._txt(frame, f"  Absent   {m.face_absent_secs:.1f}s", 185, ab_col)
+        self._bar(
+            frame,
+            8,
+            190,
+            252,
+            6,
+            m.face_absent_secs / CFG["FACE_ABSENT_MODERATE_S"],
+            (0, 160, 180)
+        )
 
-        cv2.line(frame, (0,230), (255,230), (50,50,50), 1)
+        cv2.line(frame, (0, 200), (270, 200), (50, 50, 50), 1)
 
-        # Fatigue level
-        self._txt(frame, "FATIGUE LEVEL", 252,
-                  (255,255,255), 0.55, True)
-        self._txt(frame, f"  Score : {m.fatigue_score:.2f}", 274)
-        self._txt(frame, f"  Level : {LEVEL_LABEL[lvl]}",
-                  298, col, 0.62, True)
-        self._bar(frame, 8, 307, 238, 10, m.fatigue_score, col)
-        self._txt(frame, f"  x{self._time_multiplier():.1f} time weight",
-                  328, (120,120,120), 0.45)
-        self._txt(frame, "  MOVE=start  STOP=end",
-                  348, (80,80,80), 0.40)
+        # Member 2 status.
+        self._txt(frame, "M2 USER STATE", 217, (255, 255, 255), 0.50, True)
+        self._status_dot(frame, 255, 213, self.m2.received)
 
-        # Intervention banner
-        if now < self.intv_show_until and self.intv_text:
-            txt = self.intv_text
+        if self.m2.received:
+            p_col = (0, 200, 100) if self.m2.user_present else (0, 80, 255)
+            self._txt(
+                frame,
+                f"  Present  {'YES' if self.m2.user_present else 'NO'}",
+                235,
+                p_col
+            )
+            self._txt(
+                frame,
+                f"  Eyes miss {self.m2.consecutive_eyes_missing}  "
+                f"Face abs {self.m2.consecutive_face_absent}",
+                252,
+                (180, 180, 180),
+                0.42
+            )
+        else:
+            self._txt(frame, "  Not connected", 235, (80, 80, 80))
+
+        cv2.line(frame, (0, 262), (270, 262), (50, 50, 50), 1)
+
+        # Member 6 status.
+        self._txt(frame, "M6 HEAD POSTURE", 279, (255, 255, 255), 0.50, True)
+        self._status_dot(frame, 255, 275, self.m6.received)
+
+        if self.m6.received:
+            cal_col = (0, 200, 100) if self.m6.calibrated else (180, 180, 0)
+            self._txt(
+                frame,
+                f"  {'Calibrated' if self.m6.calibrated else 'Calibrating...'}",
+                297,
+                cal_col
+            )
+            hd_col = (0, 80, 255) if self.m6.head_down else (0, 200, 100)
+            self._txt(
+                frame,
+                f"  Down:{'YES' if self.m6.head_down else 'NO'} "
+                f"Score:{self.m6.posture_score:.2f}",
+                314,
+                hd_col
+            )
+        else:
+            self._txt(frame, "  Not connected", 297, (80, 80, 80))
+
+        cv2.line(frame, (0, 325), (270, 325), (50, 50, 50), 1)
+
+        # Fatigue output.
+        self._txt(frame, "FATIGUE OUTPUT", 343, (255, 255, 255), 0.52, True)
+        self._txt(frame, f"  Score : {m.fatigue_score:.2f}", 363)
+        self._txt(
+            frame,
+            f"  Level : {LEVEL_LABEL[lvl]}",
+            383,
+            col,
+            0.60,
+            True
+        )
+        self._bar(frame, 8, 390, 252, 10, m.fatigue_score, col)
+
+        tts_mode = "LOCAL TTS" if self.local_tts else "LLM TTS"
+        self._txt(
+            frame,
+            f"  x{self._time_multiplier():.1f} time weight  [{tts_mode}]",
+            410,
+            (80, 80, 80),
+            0.38
+        )
+
+        # Overlay message.
+        if now < self.overlay_until and self.overlay_msg:
+            txt = self.overlay_msg
             (tw, th), _ = cv2.getTextSize(
-                txt, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
-            cx  = w // 2
-            cy  = h - 50
-            pad = 10
-            cv2.rectangle(frame,
-                          (cx-tw//2-pad, cy-th-pad),
-                          (cx+tw//2+pad, cy+pad),
-                          (0,0,0), -1)
-            cv2.rectangle(frame,
-                          (cx-tw//2-pad, cy-th-pad),
-                          (cx+tw//2+pad, cy+pad),
-                          col, 2)
-            cv2.putText(frame, txt, (cx-tw//2, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.60, col, 2, cv2.LINE_AA)
+                txt,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                2
+            )
+            cx, cy, pad = w // 2, h - 50, 10
+
+            cv2.rectangle(
+                frame,
+                (cx - tw // 2 - pad, cy - th - pad),
+                (cx + tw // 2 + pad, cy + pad),
+                (0, 0, 0),
+                -1
+            )
+            cv2.rectangle(
+                frame,
+                (cx - tw // 2 - pad, cy - th - pad),
+                (cx + tw // 2 + pad, cy + pad),
+                col,
+                2
+            )
+            cv2.putText(
+                frame,
+                txt,
+                (cx - tw // 2, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                col,
+                2,
+                cv2.LINE_AA
+            )
+
+        self._txt(
+            frame,
+            "Publishing /focus_robot/fatigue_summary + /tts_request",
+            h - 8,
+            (60, 60, 60),
+            0.38
+        )
 
         return frame
 
-    # ──────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
     # LOGGING
-    # ──────────────────────────────────────
-
+    # ──────────────────────────────────────────────────────────────────────
     def _init_log(self):
         with open(self.log_path, "w") as f:
-            f.write("Fatigue Detection Session Log\n")
+            f.write("Fatigue Detection Session Log — Integrated with TTS\n")
             f.write(
                 f"Started : "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
             f.write(
-                f"CFG     : WARMUP={CFG['WARMUP_SECS']}s  "
-                f"MIN_GAP={CFG['MIN_INTV_GAP_SECS']}s  "
-                f"EAR={CFG['EAR_CLOSE_THRESH']}\n")
-            f.write("-" * 70 + "\n")
+                f"M2 available: {_M2_OK} | "
+                f"M6 available: {_M6_OK} | "
+                f"local_tts_enabled: {self.local_tts}\n"
+            )
+            f.write("-" * 72 + "\n")
             f.write(
                 f"{'TIME':>8}  {'TYPE':<14} {'LEVEL':<10} "
                 f"{'SCORE':>6} {'PERCLOS':>8} "
-                f"{'PITCH':>8} {'ABSENT':>8} {'MULTx':>6}\n")
-            f.write("-" * 70 + "\n")
+                f"{'PITCH':>8} {'ABSENT':>8} "
+                f"{'M6SCORE':>8}\n"
+            )
+            f.write("-" * 72 + "\n")
 
     def _elapsed_str(self) -> str:
         mm = int(self.s.elapsed_secs // 60)
         ss = int(self.s.elapsed_secs  % 60)
+
         return f"{mm:02d}:{ss:02d}"
 
     def _write_log(self, entry_type: str):
         m = self.m
+
         with open(self.log_path, "a") as f:
             f.write(
                 f"{self._elapsed_str():>8}  "
                 f"{entry_type:<14} "
                 f"{LEVEL_LABEL[m.fatigue_level]:<10} "
                 f"{m.fatigue_score:>6.2f} "
-                f"{m.perclos*100:>7.1f}% "
+                f"{m.perclos * 100:>7.1f}% "
                 f"{m.head_pitch:>7.1f}d "
                 f"{m.face_absent_secs:>7.1f}s "
-                f"{self._time_multiplier():>5.1f}x\n"
+                f"{self.m6.posture_score:>7.3f}\n"
             )
 
     def _write_event(self, label: str):
@@ -563,19 +1065,20 @@ class FatigueMonitor:
                 f"| elapsed {self._elapsed_str()}\n\n"
             )
 
-    # ──────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
     # RUN AND CLEANUP
-    # ──────────────────────────────────────
-
+    # ──────────────────────────────────────────────────────────────────────
     def run(self):
-        rospy.loginfo("FatigueMonitor: spinning — say MOVE to begin")
+        rospy.loginfo(
+            "FatigueMonitor: spinning — publishing to "
+            "/focus_robot/fatigue_summary"
+        )
         rospy.spin()
 
     def cleanup(self):
-        self.soundhandle.stopAll()
         cv2.destroyAllWindows()
         self._write_event("NODE SHUTDOWN")
-        rospy.loginfo(f"FatigueMonitor: log saved to {self.log_path}")
+        rospy.loginfo("FatigueMonitor: log saved to %s", self.log_path)
 
 
 if __name__ == "__main__":
