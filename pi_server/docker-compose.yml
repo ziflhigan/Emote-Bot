@@ -3,7 +3,7 @@
 
 services:
   ollama:
-    image: ollama/ollama:0.24.0
+    image: ollama/ollama:latest
     container_name: vlm-ollama
     restart: unless-stopped
     # Only reachable from within the compose network; not published to host.
@@ -47,7 +47,6 @@ services:
       COOLDOWN_SECS: "30"
       FATIGUE_LEVEL_TRIGGER: "2"
       EYES_MISSING_TRIGGER: "30"
-      OLLAMA_TIMEOUT_SECS: "60"
     volumes:
       # Live-mount app code; remove this line if you want a fully baked image.
       - ./app:/srv/app:ro

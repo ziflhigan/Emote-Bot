@@ -20,7 +20,10 @@ from .schemas import Command, FatigueContext, ParseCommandOut, Signals
 
 logger = logging.getLogger(__name__)
 
-_client = AsyncClient(host=config.OLLAMA_HOST, timeout=config.OLLAMA_TIMEOUT_SECS)
+_client = AsyncClient(
+    host=config.OLLAMA_HOST,
+    timeout=None,   # wait indefinitely — Pi 5 CPU inference can be slow
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -127,12 +130,14 @@ async def run_inference(image_b64: str, signals: Signals,
                  "images": [image_b64]},
             ],
             options={"temperature": 0.3},
+            think=False,
+            keep_alive=-1,
         )
     except Exception as exc:
         logger.exception("VLM nudge call failed: %s", exc)
         return None
 
-    raw = response.get("message", {}).get("content", "")
+    raw = response.message.content or ""
     logger.info("VLM nudge reply: %s", raw[:300])
     return _parse_nudge_response(raw)
 
@@ -227,14 +232,16 @@ async def parse_voice_command(
                 {"role": "system", "content": _PARSE_SYSTEM},
                 {"role": "user",   "content": user_prompt},
             ],
-            options={"temperature": 0.1},  # low temp for deterministic parsing
+            options={"temperature": 0.1},
+            think=False,
+            keep_alive=-1,
         )
     except Exception as exc:
         logger.exception("parse_voice_command failed: %s", exc)
         return ParseCommandOut(action="unknown", params={},
                                response_text="Sorry, I could not process that.")
 
-    raw = response.get("message", {}).get("content", "")
+    raw = response.message.content or ""
     logger.info("parse_command reply: %s", raw[:300])
     result = _parse_command_response(raw)
     if result is None:
