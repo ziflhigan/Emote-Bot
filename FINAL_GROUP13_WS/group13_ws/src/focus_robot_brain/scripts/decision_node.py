@@ -244,7 +244,7 @@ class DecisionNode:
 
         # Config.
         self._server_url   = rospy.get_param("~server_url",
-                                             "http://raspberrypi.local:8000")
+                                             "http://hvepyc-pi5.local:8000")
         self._device_id    = rospy.get_param("~device_id", "robot-01")
         # No HTTP timeouts — we wait however long the server needs.
         # parse_command can take 30-90s on a Pi 5 CPU; that is fine.
