@@ -1,8 +1,13 @@
-"""VLM interaction.
+"""VLM interaction — fatigue-triggered nudges + voice command parsing.
 
-Given an image + a snapshot of the user's state signals, ask the model
-what to say (if anything). The model's job is qualitative interpretation;
-the numeric signals already told us *something* is up.
+Two public functions:
+  run_inference()      — given image + signals, decide if/what to say
+  parse_voice_command() — given free-form text + context, return structured action
+
+CHANGES FROM PREVIOUS VERSION:
+  - run_inference() prompt now includes session duration and intervention count.
+  - New parse_voice_command() function handles the /parse_command endpoint.
+    Uses a separate lightweight prompt; no image needed.
 """
 import json
 import logging
@@ -11,125 +16,228 @@ from typing import Optional
 from ollama import AsyncClient
 
 from . import config
-from .schemas import Command, Signals
+from .schemas import Command, FatigueContext, ParseCommandOut, Signals
 
 logger = logging.getLogger(__name__)
 
 _client = AsyncClient(host=config.OLLAMA_HOST, timeout=config.OLLAMA_TIMEOUT_SECS)
 
 
-SYSTEM_PROMPT = """You are a gentle wellness assistant observing a user during a focus session.
+# ─────────────────────────────────────────────────────────
+# FATIGUE NUDGE INFERENCE
+# ─────────────────────────────────────────────────────────
+
+_NUDGE_SYSTEM = """You are a gentle wellness assistant observing a user during a focus session.
 
 You will be given:
 - A photo of the user at their workspace
-- Numeric signals from sensors describing what the cameras have detected
+- Sensor signals describing detected fatigue and posture
+- Session context: how long the user has been working and how many reminders they have already received
 
-Your job: decide if the user needs a short verbal nudge, and if so, what to say.
+Your job: decide if the user needs a short verbal nudge, and if so what to say.
 
 Respond ONLY with valid JSON in exactly this form:
-
   {"speak": true,  "text": "<one short sentence, under 20 words, warm and non-alarming>"}
   {"speak": false, "text": ""}
 
-Choose speak=false if the user looks fine and the signals are likely a false alarm
-(e.g. they're just looking down at a notebook, not actually fatigued).
-Choose speak=true if they genuinely look tired, distracted, or absent.
+Rules:
+- speak=false if the user looks fine or signals are likely a false alarm (looking at notebook, not actually asleep)
+- speak=true if they genuinely look tired, distracted, eyes closed, or slumped
+- Never alarming. Never repeat the same phrase if intervention_count > 1.
+- If intervention_count >= 3 and fatigue is still high, suggest ending the session.
+- Keep messages brief and kind.
 
-Keep the message brief, kind, and never alarming. Examples of good messages:
+Good examples:
   "Looks like a good moment for a short break."
   "Your posture is drifting — a quick stretch might help."
-  "Take a breath; you've been at this a while."
+  "You've been at this for a while. How about a five-minute pause?"
+  "You look quite tired. It might be worth ending the session for today."
 """
 
 
-def _summarize_signals(signals: Signals) -> str:
-    """Compact, human-readable summary of the current signals."""
+def _summarize_signals(signals: Signals, session_ctx: dict) -> str:
     parts: list[str] = []
 
     if signals.fatigue_level is not None:
         labels = {0: "ALERT", 1: "MILD", 2: "MODERATE", 3: "SEVERE"}
         parts.append("fatigue=%s" % labels.get(signals.fatigue_level, "?"))
-    if signals.session_active is not None:
-        parts.append("session_active=%s" % signals.session_active)
-    if signals.user_state:
-        us = signals.user_state
-        parts.append("user_present=%s" % us.user_present)
-        if us.consecutive_eyes_missing:
-            parts.append("eyes_missing_frames=%d" % us.consecutive_eyes_missing)
-        if us.consecutive_face_absent:
-            parts.append("face_absent_frames=%d" % us.consecutive_face_absent)
-    if signals.head_posture:
-        hp = signals.head_posture
-        parts.append("head_down=%s" % hp.head_down)
-        parts.append("posture_score=%.2f" % hp.posture_score)
-        if not hp.pose_visible:
-            parts.append("pose_not_visible")
 
-    return ", ".join(parts) if parts else "(no signals yet)"
+    ef = signals.extra_fields
+    for key in ("fatigue_score", "perclos", "ear", "face_absent_secs"):
+        if ef.get(key) is not None:
+            parts.append("%s=%.2f" % (key, ef[key]))
+
+    if ef.get("m6_head_down"):
+        parts.append("head_down=True")
+    if ef.get("m6_posture_score") is not None:
+        parts.append("posture_score=%.2f" % ef["m6_posture_score"])
+    if ef.get("m2_user_present") is not None:
+        parts.append("user_present=%s" % ef["m2_user_present"])
+    if ef.get("m2_consecutive_eyes_missing"):
+        parts.append("eyes_missing_frames=%d" % ef["m2_consecutive_eyes_missing"])
+
+    # Session context.
+    parts.append("session_elapsed_mins=%.1f" % session_ctx.get("elapsed_mins", 0))
+    parts.append("interventions_so_far=%d" % session_ctx.get("intervention_count", 0))
+
+    return ", ".join(parts) if parts else "(no signals)"
 
 
-def _parse_response(raw: str) -> Optional[Command]:
-    """Parse the model's JSON reply. Returns None on any failure or if the
-    model elected not to speak."""
-    # Strip code fences if the model wrapped its reply.
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-
+def _parse_nudge_response(raw: str) -> Optional[Command]:
+    text = raw.strip().strip("`")
+    if text.startswith("json"):
+        text = text[4:].strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Try to find a JSON object in the response.
-        start = text.find("{")
-        end = text.rfind("}")
+        start, end = text.find("{"), text.rfind("}")
         if start == -1 or end == -1:
             logger.warning("VLM reply not JSON: %r", raw[:200])
             return None
         try:
             data = json.loads(text[start:end + 1])
         except json.JSONDecodeError:
-            logger.warning("VLM reply not parseable: %r", raw[:200])
+            logger.warning("VLM reply unparseable: %r", raw[:200])
             return None
 
     if not isinstance(data, dict) or not data.get("speak"):
         return None
-
     msg = (data.get("text") or "").strip()
     if not msg:
         return None
-
     return Command(action="speak", text=msg)
 
 
-async def run_inference(image_b64: str, signals: Signals) -> Optional[Command]:
-    """Invoke the VLM. Returns a Command to enqueue, or None to stay silent."""
-    signals_summary = _summarize_signals(signals)
+async def run_inference(image_b64: str, signals: Signals,
+                        session_ctx: dict) -> Optional[Command]:
+    """Run VLM fatigue nudge inference. Returns a Command or None."""
+    summary = _summarize_signals(signals, session_ctx)
     user_prompt = (
-        "Sensor signals right now: %s\n\n"
-        "Look at the attached photo and decide if the user needs a nudge. "
-        "Respond with the JSON format described."
-    ) % signals_summary
+        "Sensor signals: %s\n\n"
+        "Look at the photo and decide if the user needs a nudge. "
+        "Reply with the JSON format."
+    ) % summary
 
     try:
         response = await _client.chat(
             model=config.OLLAMA_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                    "images": [image_b64],
-                },
+                {"role": "system", "content": _NUDGE_SYSTEM},
+                {"role": "user",   "content": user_prompt,
+                 "images": [image_b64]},
             ],
             options={"temperature": 0.3},
         )
     except Exception as exc:
-        logger.exception("VLM call failed: %s", exc)
+        logger.exception("VLM nudge call failed: %s", exc)
         return None
 
     raw = response.get("message", {}).get("content", "")
-    logger.info("VLM raw reply: %s", raw[:300])
-    return _parse_response(raw)
+    logger.info("VLM nudge reply: %s", raw[:300])
+    return _parse_nudge_response(raw)
+
+
+# ─────────────────────────────────────────────────────────
+# VOICE COMMAND PARSING
+# ─────────────────────────────────────────────────────────
+
+_PARSE_SYSTEM = """You are a command parser for a focus-session robot assistant.
+
+The user has spoken a command (wake word already removed). Your job is to
+interpret it and return a structured action.
+
+Valid actions:
+  start_session   params: {"duration_mins": <int or null>}
+  end_session     params: {}
+  pause_session   params: {}
+  resume_session  params: {}
+  status          params: {}
+  dismiss         params: {}
+  unknown         params: {}   (use when the command doesn't fit any above)
+
+Respond ONLY with valid JSON:
+  {"action": "<action>", "params": {<params>}, "response_text": "<optional short TTS ack>"}
+
+Examples:
+  "start a pomodoro"        -> {"action": "start_session", "params": {"duration_mins": 25}, "response_text": "Starting a 25-minute pomodoro session."}
+  "let's work for an hour"  -> {"action": "start_session", "params": {"duration_mins": 60}, "response_text": "Starting a 60-minute session."}
+  "I'm done for today"      -> {"action": "end_session",   "params": {}, "response_text": "Ending your session. Great work!"}
+  "how long have I been on" -> {"action": "status",        "params": {}, "response_text": null}
+  "never mind"              -> {"action": "dismiss",       "params": {}, "response_text": "Noted."}
+  "play some music"         -> {"action": "unknown",       "params": {}, "response_text": "Sorry, I cannot help with that."}
+"""
+
+
+def _parse_command_response(raw: str) -> Optional[ParseCommandOut]:
+    text = raw.strip().strip("`")
+    if text.startswith("json"):
+        text = text[4:].strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end == -1:
+            logger.warning("parse_command reply not JSON: %r", raw[:200])
+            return None
+        try:
+            data = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+    return ParseCommandOut(
+        action=data.get("action", "unknown"),
+        params=data.get("params", {}),
+        response_text=data.get("response_text"),
+    )
+
+
+async def parse_voice_command(
+        text: str,
+        session_active: bool,
+        session_paused: bool,
+        elapsed_secs: float,
+        fatigue_context: Optional[FatigueContext],
+) -> ParseCommandOut:
+    """Ask the LLM to interpret a free-form voice command.
+    Returns ParseCommandOut; never raises (falls back to 'unknown')."""
+
+    fatigue_str = ""
+    if fatigue_context:
+        fatigue_str = " (current fatigue: %s)" % (
+            fatigue_context.fatigue_label or
+            ("level %d" % fatigue_context.fatigue_level
+             if fatigue_context.fatigue_level is not None else "unknown")
+        )
+
+    context_line = "Session state: %s. Elapsed: %.0f mins.%s" % (
+        "active" if session_active else ("paused" if session_paused else "idle"),
+        elapsed_secs / 60.0,
+        fatigue_str,
+    )
+
+    user_prompt = 'Context: %s\n\nUser said: "%s"\n\nParse into a structured action.' \
+                  % (context_line, text)
+
+    try:
+        response = await _client.chat(
+            model=config.OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": _PARSE_SYSTEM},
+                {"role": "user",   "content": user_prompt},
+            ],
+            options={"temperature": 0.1},  # low temp for deterministic parsing
+        )
+    except Exception as exc:
+        logger.exception("parse_voice_command failed: %s", exc)
+        return ParseCommandOut(action="unknown", params={},
+                               response_text="Sorry, I could not process that.")
+
+    raw = response.get("message", {}).get("content", "")
+    logger.info("parse_command reply: %s", raw[:300])
+    result = _parse_command_response(raw)
+    if result is None:
+        return ParseCommandOut(action="unknown", params={},
+                               response_text="Sorry, I did not understand.")
+    return result
