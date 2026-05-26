@@ -4,7 +4,7 @@
 #             file="$(find focus_robot_bridge)/config/bridge_params.yaml"
 #             ns="server_bridge"/>
 
-server_url: "http://raspberrypi.local:8000"
+server_url: "http://hvepyc-pi5.local:8000"
 device_id:  "robot-01"
 
 # Topics the bridge subscribes to.
