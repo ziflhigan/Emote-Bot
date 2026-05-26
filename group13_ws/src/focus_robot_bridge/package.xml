@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>focus_robot_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    Bridges ROS topics (fatigue summary, session state, camera) to a
+    remote FastAPI/VLM server. Posts telemetry and images, polls for
+    commands, and relays them back onto /focus_robot/server_command.
+  </description>
+
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Only standard ROS deps needed — bridge reads fatigue_summary as
+       std_msgs/String (JSON), so no custom message imports required. -->
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+
+  <!-- Python HTTP client. apt: python3-requests -->
+  <exec_depend>python3-requests</exec_depend>
+
+  <export>
+  </export>
+</package>

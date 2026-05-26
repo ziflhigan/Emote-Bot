@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!--
+    Launch the focus robot decision / brain node.
+
+    Override params on the command line:
+        roslaunch focus_robot_brain decision_node.launch \
+            server_url:=http://192.168.1.42:8000 \
+            device_id:=robot-lab-a
+-->
+<launch>
+  <arg name="server_url"          default="http://raspberrypi.local:8000"/>
+  <arg name="device_id"           default="robot-01"/>
+  <arg name="status_period"       default="5.0"/>
+  <arg name="max_session_mins"    default="120.0"/>
+
+  <!-- Note: no http_timeout — all server calls wait indefinitely.
+       parse_command can take 30-90s on Pi 5 CPU; that is expected. -->
+
+  <node pkg="focus_robot_brain"
+        type="decision_node.py"
+        name="decision_node"
+        output="screen"
+        respawn="true"
+        respawn_delay="5">
+
+    <param name="server_url"        value="$(arg server_url)"/>
+    <param name="device_id"         value="$(arg device_id)"/>
+    <param name="status_period"     value="$(arg status_period)"/>
+    <param name="max_session_mins"  value="$(arg max_session_mins)"/>
+  </node>
+</launch>
