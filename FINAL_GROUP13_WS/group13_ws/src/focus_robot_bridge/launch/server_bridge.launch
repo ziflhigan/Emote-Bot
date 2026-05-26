@@ -10,7 +10,7 @@
 <launch>
 
   <!-- ── Args ── -->
-  <arg name="server_url"              default="http://raspberrypi.local:8000"/>
+  <arg name="server_url"              default="http://hvepyc-pi5.local:8000"/>
   <arg name="device_id"               default="robot-01"/>
 
   <!-- Topics the bridge reads from. -->

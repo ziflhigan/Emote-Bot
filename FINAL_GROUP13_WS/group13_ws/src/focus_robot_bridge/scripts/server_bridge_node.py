@@ -40,7 +40,7 @@ from std_msgs.msg import Bool, String
 # CONFIG (all overridable via ROS params)
 # ─────────────────────────────────────────────────────────
 DEFAULTS = {
-    "server_url":            "http://raspberrypi.local:8000",
+    "server_url":            "http://hvepyc-pi5.local:8000",
     "device_id":             "robot-01",
 
     # Topics to subscribe to.
