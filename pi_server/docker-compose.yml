@@ -3,7 +3,7 @@
 
 services:
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.24.0
     container_name: vlm-ollama
     restart: unless-stopped
     # Only reachable from within the compose network; not published to host.
