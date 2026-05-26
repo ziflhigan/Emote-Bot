@@ -1,0 +1,4 @@
+bool  user_present
+int32 consecutive_eyes_missing
+int32 consecutive_face_absent
+time  stamp

@@ -1,0 +1,31 @@
+# Bridge parameters — optional alternative to launch file args.
+# Load with:
+#   <rosparam command="load"
+#             file="$(find focus_robot_bridge)/config/bridge_params.yaml"
+#             ns="server_bridge"/>
+
+server_url: "http://hvepyc-pi5.local:8000"
+device_id:  "robot-01"
+
+# Topics the bridge subscribes to.
+# fatigue_summary is the single JSON topic from fatigue_node that contains
+# all fatigue/M2/M6 signals — no individual topic subscriptions needed.
+fatigue_summary_topic:  "/focus_robot/fatigue_summary"
+session_active_topic:   "/focus_robot/session_active"
+image_topic:            "/usb_cam/image_raw"
+
+# Topic the bridge publishes relayed server commands onto.
+# decision_node subscribes here to receive VLM nudges and session commands.
+server_command_topic:   "/focus_robot/server_command"
+
+# Cadence (seconds).
+telemetry_period:    1.0
+image_period:        15.0
+command_poll_period: 5.0
+
+# Image encoding.
+image_max_width:    400
+image_jpeg_quality: 80
+
+# HTTP: no timeout — all calls wait indefinitely.
+http_log_failures:  true

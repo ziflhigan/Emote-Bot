@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>speech_output_module</name>
+  <version>0.0.1</version>
+  <description>Text-to-speech output module for the focus robot. Subscribes to /tts_request and speaks the text via sound_play.</description>
+
+  <maintainer email="team13@example.com">Group 13</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>sound_play</build_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sound_play</exec_depend>
+
+  <export>
+  </export>
+</package>

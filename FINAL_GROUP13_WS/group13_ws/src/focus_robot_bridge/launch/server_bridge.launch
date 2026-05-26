@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<!--
+    Launch the server bridge node.
+
+    Override on the command line, e.g.:
+        roslaunch focus_robot_bridge server_bridge.launch \
+            server_url:=http://192.168.1.42:8000 \
+            device_id:=robot-lab-a
+-->
+<launch>
+
+  <!-- ── Args ── -->
+  <arg name="server_url"              default="http://raspberrypi.local:8000"/>
+  <arg name="device_id"               default="robot-01"/>
+
+  <!-- Topics the bridge reads from. -->
+  <arg name="fatigue_summary_topic"   default="/focus_robot/fatigue_summary"/>
+  <arg name="session_active_topic"    default="/focus_robot/session_active"/>
+  <arg name="image_topic"             default="/usb_cam/image_raw"/>
+
+  <!-- Topic the bridge publishes server commands onto (decision_node reads this). -->
+  <arg name="server_command_topic"    default="/focus_robot/server_command"/>
+
+  <!-- Cadence (seconds). -->
+  <arg name="telemetry_period"        default="1.0"/>
+  <arg name="image_period"            default="15.0"/>
+  <arg name="command_poll_period"     default="5.0"/>
+
+  <!-- Image encoding. -->
+  <arg name="image_max_width"         default="640"/>
+  <arg name="image_jpeg_quality"      default="80"/>
+
+  <!-- Note: no http_timeout — all HTTP calls wait indefinitely. -->
+
+  <node pkg="focus_robot_bridge"
+        type="server_bridge_node.py"
+        name="server_bridge"
+        output="screen"
+        respawn="true"
+        respawn_delay="5">
+
+    <param name="server_url"            value="$(arg server_url)"/>
+    <param name="device_id"             value="$(arg device_id)"/>
+
+    <param name="fatigue_summary_topic" value="$(arg fatigue_summary_topic)"/>
+    <param name="session_active_topic"  value="$(arg session_active_topic)"/>
+    <param name="image_topic"           value="$(arg image_topic)"/>
+    <param name="server_command_topic"  value="$(arg server_command_topic)"/>
+
+    <param name="telemetry_period"      value="$(arg telemetry_period)"/>
+    <param name="image_period"          value="$(arg image_period)"/>
+    <param name="command_poll_period"   value="$(arg command_poll_period)"/>
+
+    <param name="image_max_width"       value="$(arg image_max_width)"/>
+    <param name="image_jpeg_quality"    value="$(arg image_jpeg_quality)"/>
+  </node>
+
+</launch>
